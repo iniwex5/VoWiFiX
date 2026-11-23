@@ -1,0 +1,8 @@
+-dontobfuscate
+-keep class io.iniwex.vowifix.VoWiFiXEntry { *; }
+-keep class io.iniwex.vowifix.ActivationStatus { *; }
+-keep class io.iniwex.vowifix.MainActivity { *; }
+-keep class io.iniwex.vowifix.VoWiFiXTileService { *; }
+-keepclassmembers class io.iniwex.vowifix.** { *; }
+-dontwarn de.robv.android.xposed.**
+-dontwarn android.os.SystemProperties

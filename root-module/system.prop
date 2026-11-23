@@ -1,0 +1,5 @@
+# Layer 1：精简通用 IMS/VoWiFi 能力覆盖（移除过时 CDMA/LTE 兼容属性，避免干扰 5G/双卡驻网）
+persist.dbg.ims_volte_enable=1
+persist.dbg.volte_avail_ovr=1
+persist.dbg.vt_avail_ovr=1
+persist.dbg.wfc_avail_ovr=1

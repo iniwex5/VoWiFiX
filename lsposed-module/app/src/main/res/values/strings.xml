@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VoWiFiX</string>
+    <string name="xposed_description">原生基带 VoWiFi 与跨国漫游全栈增强模块（LSPosed 解锁 + EFS 漫游开关修补 + 切卡自动热适配）</string>
+</resources>
