@@ -38,6 +38,7 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
 
     private static final String LAUNCHER_ALIAS_CLASS = "io.iniwex.vowifix.LauncherAlias";
+    private static final String NOTICE_LOADING_EFS = "正在读取双卡与 EFS 状态...";
     private static final long REFRESH_COOLDOWN_MS = 45_000L;
     private static final long POST_RESET_GUARD_MS = 20_000L;
 
@@ -545,9 +546,17 @@ public class MainActivity extends Activity {
     }
 
     private void refreshStateAsync(boolean queryEfs, boolean preserveExistingEfs) {
+        refreshStateAsync(queryEfs, preserveExistingEfs, false);
+    }
+
+    /**
+     * 异步采集双卡与 EFS 状态并刷新界面；preserveNotice 为 true 时保留已有操作结果提示条。
+     */
+    private void refreshStateAsync(boolean queryEfs, boolean preserveExistingEfs, boolean preserveNotice) {
         final TelephonyProbe.EfsSlotStatus[] prevEfs = latestSnapshot != null ? latestSnapshot.efs : null;
+        final boolean showLoadingNotice = !preserveExistingEfs && queryEfs && !preserveNotice;
         if (!preserveExistingEfs) {
-            setBusy(true, queryEfs ? "正在读取双卡与 EFS 状态..." : null);
+            setBusy(true, showLoadingNotice ? NOTICE_LOADING_EFS : null);
         }
         worker.execute(() -> {
             TelephonyProbe.FullSnapshot snap = TelephonyProbe.collectSnapshot(queryEfs);
@@ -561,6 +570,12 @@ public class MainActivity extends Activity {
                 latestSnapshot = snap;
                 if (!preserveExistingEfs) {
                     setBusy(false, null);
+                    if (showLoadingNotice && tvProgressBanner != null) {
+                        CharSequence cur = tvProgressBanner.getText();
+                        if (cur != null && NOTICE_LOADING_EFS.equals(cur.toString())) {
+                            hideProgressNotice();
+                        }
+                    }
                 }
                 renderSnapshot(snap);
                 VoWiFiXTileService.requestTileRefresh(this);
@@ -729,10 +744,9 @@ public class MainActivity extends Activity {
                     return;
                 }
                 setBusy(false, null);
+                hideProgressNotice();
                 if (!r.isSuccess()) {
                     Toast.makeText(this, "切换守护状态失败: " + r.stderr, Toast.LENGTH_SHORT).show();
-                } else {
-                    hideProgressNotice();
                 }
                 refreshStateAsync(false, true);
             });
@@ -977,7 +991,7 @@ public class MainActivity extends Activity {
         if (!r.isSuccess()) {
             String err = r.stderr.isEmpty() ? r.stdout : r.stderr;
             setBusy(false, actionName + "失败 (exit=" + r.exitCode + "): " + summarizeLastLine(err));
-            refreshStateAsync(!refreshed, refreshed);
+            refreshStateAsync(!refreshed, refreshed, true);
             return;
         }
 
@@ -989,13 +1003,13 @@ public class MainActivity extends Activity {
             refreshStateAsync(false, true);
         } else if (r.stdout.contains("VOWIFIX_RESTORED_COOLDOWN=1")) {
             setBusy(false, "已还原原始备份并完成 6s 落盘（45s 刷新冷却中，请稍后手动刷新或重启）");
-            refreshStateAsync(true, false);
+            refreshStateAsync(true, false, true);
         } else if (r.stdout.contains("VOWIFIX_ALREADY_CLEAN=1")) {
             setBusy(false, "当前状态已对齐，无需改动（若需强制重载可点“仅触发基带热刷新”）");
-            refreshStateAsync(true, false);
+            refreshStateAsync(true, false, true);
         } else {
             setBusy(false, actionName + "已执行完成");
-            refreshStateAsync(true, false);
+            refreshStateAsync(true, false, true);
         }
     }
 
