@@ -10,7 +10,7 @@ ROOT_MOD_DIR="$ROOT_DIR/root-module"
 BIN_OUT="$ROOT_MOD_DIR/system/bin/vowifix-efs"
 LSP_DIR="$ROOT_DIR/lsposed-module"
 
-VERSION="v1.0.0"
+VERSION="v1.0.1"
 ZIP_OUT="$DIST_DIR/VoWiFiX-${VERSION}.zip"
 APK_OUT="$DIST_DIR/VoWiFiX-LSPosed-${VERSION}.apk"
 
@@ -104,6 +104,7 @@ run_host_selftest() {
     trap 'rm -f "$host_bin"' RETURN
     "$cc_bin" -O2 -Wall -Wextra "$C_SRC" -o "$host_bin"
     "$host_bin" --self-test
+    [ "$("$host_bin" --backend=none detect)" = "BACKEND=none" ] || die "detect --backend=none 校验失败"
     rm -f "$host_bin"
     trap - RETURN
 }

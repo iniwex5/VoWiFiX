@@ -51,6 +51,7 @@ public class MainActivity extends Activity {
 
     private TextView badgeLsposed;
     private TextView badgeRoot;
+    private TextView badgeDiag;
     private TextView badgeWatcher;
     private TextView tvBaseband;
     private LinearLayout bannerNoRoot;
@@ -106,7 +107,7 @@ public class MainActivity extends Activity {
             firstResumeDone = true;
             return;
         }
-        // 切回前台仅执行不触碰 /dev/diag 的轻量刷新，避免高频读取基带
+        // 切回前台仅执行不触碰 Diag 通道的轻量刷新，避免高频读取基带
         if (!busy) {
             refreshStateAsync(false, true);
         }
@@ -233,7 +234,7 @@ public class MainActivity extends Activity {
         tvApp.setTypeface(Typeface.DEFAULT_BOLD);
         titleGroup.addView(tvApp);
 
-        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.0", palette.accent, palette.accentBg);
+        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.1", palette.accent, palette.accentBg);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         verLp.leftMargin = UiHelper.dp(this, 8);
@@ -262,6 +263,7 @@ public class MainActivity extends Activity {
 
         badgeLsposed = addStatusRow(card, "LSPosed 框架", "检测中...");
         badgeRoot = addStatusRow(card, "Root 与模块", "检测中...");
+        badgeDiag = addStatusRow(card, "基带 Diag 通道", "检测中...");
         badgeWatcher = addStatusRow(card, "切卡守护进程", "检测中...");
 
         tvBaseband = new TextView(this);
@@ -534,7 +536,7 @@ public class MainActivity extends Activity {
         long sinceReset = SystemClock.elapsedRealtime() - lastRefreshElapsedMs;
         if (lastRefreshElapsedMs > 0 && sinceReset < POST_RESET_GUARD_MS) {
             long waitSec = (POST_RESET_GUARD_MS - sinceReset + 999L) / 1000L;
-            showProgressNotice("基带热刷新稳定窗口中，已跳过 /dev/diag 探测（" + waitSec + "s 后可完整读取）");
+            showProgressNotice("基带热刷新稳定窗口中，已跳过 Diag 探测（" + waitSec + "s 后可完整读取）");
             refreshStateAsync(false, false);
             return;
         }
@@ -577,6 +579,7 @@ public class MainActivity extends Activity {
 
         if (!snap.hasRoot) {
             UiHelper.styleBadge(this, badgeRoot, "无 Root (只读)", palette.warning, palette.warningBg);
+            UiHelper.styleBadge(this, badgeDiag, "需 Root 探测", palette.neutral, palette.neutralBg);
             UiHelper.styleBadge(this, badgeWatcher, "需 Root 探测", palette.neutral, palette.neutralBg);
             bannerNoRoot.setVisibility(View.VISIBLE);
         } else {
@@ -587,6 +590,14 @@ public class MainActivity extends Activity {
                 UiHelper.styleBadge(this, badgeRoot, "模块二进制缺失", palette.danger, palette.dangerBg);
             } else {
                 UiHelper.styleBadge(this, badgeRoot, "Root 已授权 · 未装 KSU 模块", palette.warning, palette.warningBg);
+            }
+
+            if (!snap.binaryAvailable) {
+                UiHelper.styleBadge(this, badgeDiag, "组件缺失", palette.danger, palette.dangerBg);
+            } else if (snap.hasDiagBackend()) {
+                UiHelper.styleBadge(this, badgeDiag, "已就绪 (" + snap.diagBackend + ")", palette.success, palette.successBg);
+            } else {
+                UiHelper.styleBadge(this, badgeDiag, "未开放 · 仅上层模式", palette.info, palette.infoBg);
             }
 
             if (!snap.watcherEnabled) {
@@ -605,9 +616,15 @@ public class MainActivity extends Activity {
         switchWatcher.setChecked(snap.hasRoot ? snap.watcherEnabled : false);
         suppressSwitchEvent = false;
         switchWatcher.setEnabled(!busy && snap.hasRoot && snap.moduleInstalled);
-        tvWatcherHint.setText(snap.hasRoot
-                ? (snap.watcherEnabled ? "插拔或切换 SIM 卡时自动修补并热刷新" : "已暂停后台自动修补，仍可下方手动热适配")
-                : "授予 Root 权限后可控制后台切卡守护");
+        if (!snap.hasRoot) {
+            tvWatcherHint.setText("授予 Root 权限后可控制后台切卡守护");
+        } else if (!snap.watcherEnabled) {
+            tvWatcherHint.setText("已暂停后台自动监听，仍可下方手动热适配");
+        } else if (snap.hasDiagBackend()) {
+            tvWatcherHint.setText("插拔或切换 SIM 卡时自动修补并热刷新");
+        } else {
+            tvWatcherHint.setText("未开放 Diag 通道，切卡时自动校准 siminfo 策略");
+        }
 
         for (int i = 0; i < 2; i++) {
             renderSlot(slotViews[i], snap.slots[i], snap.efs[i], snap.hasRoot);
@@ -622,6 +639,19 @@ public class MainActivity extends Activity {
         }
 
         updateActionButtonsAvailability();
+    }
+
+    private int resolveEfsLineColor(String state) {
+        if ("READ_ERROR".equals(state)) {
+            return palette.danger;
+        }
+        if ("UNPATCHED".equals(state)) {
+            return palette.warning;
+        }
+        if (TelephonyProbe.EfsSlotStatus.STATE_NO_DIAG.equals(state)) {
+            return palette.textMuted;
+        }
+        return palette.textSecondary;
     }
 
     private void renderSlot(
@@ -670,10 +700,10 @@ public class MainActivity extends Activity {
         }
 
         sv.tvIniStatus.setText(efs.getIniSummaryText());
-        sv.tvIniStatus.setTextColor("UNPATCHED".equals(efs.iniState) ? palette.warning : palette.textSecondary);
+        sv.tvIniStatus.setTextColor(resolveEfsLineColor(efs.iniState));
 
         sv.tvSeStatus.setText(efs.getSeSummaryText());
-        sv.tvSeStatus.setTextColor("UNPATCHED".equals(efs.seState) ? palette.warning : palette.textSecondary);
+        sv.tvSeStatus.setTextColor(resolveEfsLineColor(efs.seState));
     }
 
     private void onWatcherSwitchChanged(CompoundButton buttonView, boolean isChecked) {
@@ -719,7 +749,10 @@ public class MainActivity extends Activity {
             return;
         }
 
-        setBusy(true, "正在检查通话状态并准备 EFS 热适配...");
+        final boolean hasDiag = latestSnapshot.hasDiagBackend();
+        setBusy(true, hasDiag
+                ? "正在检查通话状态并准备 EFS 热适配..."
+                : "正在检查通话状态并准备上层与 QRTR 热适配...");
         worker.execute(() -> {
             if (TelephonyProbe.isCallActive()) {
                 mainHandler.post(() -> {
@@ -731,47 +764,64 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            String inner = RootShell.resolveBinarySnippet()
-                    + "[ -n \"$BIN\" ] || { echo 'ERR_NO_BIN'; exit 1; }\n"
-                    + "[ -c /dev/diag ] || { echo 'ERR_NO_DIAG'; exit 1; }\n"
-                    + "OUT=$(\"$BIN\" patch all --no-lock --backup-dir '" + RootShell.DATA_DIR + "' 2>&1)\n"
-                    + "PRC=$?\n"
-                    + "printf '%s\\n' \"$OUT\"\n"
-                    + "SIM_OUT=$(\n"
-                    + TelephonyProbe.normalizeSiminfoShellSnippet()
-                    + ")\n"
-                    + "printf '%s\\n' \"$SIM_OUT\"\n"
-                    + "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] patch RC=$PRC | $(echo \"$OUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
-                    + "[ \"$PRC\" -eq 0 ] || exit $PRC\n"
-                    + "HAS_EFS_CHG=0\n"
-                    + "echo \"$OUT\" | grep -qE 'CHANGED=[1-9]' && HAS_EFS_CHG=1\n"
-                    + "HAS_SIM_CHG=0\n"
-                    + "echo \"$SIM_OUT\" | grep -q 'SIMINFO_NORMALIZED=' && HAS_SIM_CHG=1\n"
-                    + "if [ \"$HAS_EFS_CHG\" -eq 1 ]; then\n"
-                    + "  echo 'VOWIFIX_PHASE:WAIT_FLUSH_6S'\n"
-                    + "  sleep 6\n"
-                    + "  if dumpsys telephony.registry 2>/dev/null | grep -qE 'mCallState=[12]'; then\n"
-                    + "    echo 'ERR_CALL_DURING_WAIT'\n"
-                    + "    exit 2\n"
-                    + "  fi\n"
-                    + "  echo 'VOWIFIX_PHASE:REFRESH_START'\n"
-                    + "  ROUT=$(\"$BIN\" refresh --no-lock 2>&1)\n"
-                    + "  RRC=$?\n"
-                    + "  printf '%s\\n' \"$ROUT\"\n"
-                    + "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] refresh RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
-                    + "  [ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
-                    + "  exit $RRC\n"
-                    + "elif [ \"$HAS_SIM_CHG\" -eq 1 ]; then\n"
-                    + "  echo 'VOWIFIX_PHASE:REFRESH_START'\n"
-                    + "  ROUT=$(\"$BIN\" refresh --no-lock 2>&1)\n"
-                    + "  RRC=$?\n"
-                    + "  printf '%s\\n' \"$ROUT\"\n"
-                    + "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] siminfo-only refresh RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
-                    + "  [ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
-                    + "  exit $RRC\n"
-                    + "else\n"
-                    + "  echo 'VOWIFIX_ALREADY_CLEAN=1'\n"
-                    + "fi\n";
+            final String inner;
+            if (hasDiag) {
+                inner = RootShell.resolveBinarySnippet()
+                        + "[ -n \"$BIN\" ] || { echo 'ERR_NO_BIN'; exit 1; }\n"
+                        + "OUT=$(\"$BIN\" patch all --no-lock --backup-dir '" + RootShell.DATA_DIR + "' 2>&1)\n"
+                        + "PRC=$?\n"
+                        + "printf '%s\\n' \"$OUT\"\n"
+                        + "SIM_OUT=$(\n"
+                        + TelephonyProbe.normalizeSiminfoShellSnippet()
+                        + ")\n"
+                        + "printf '%s\\n' \"$SIM_OUT\"\n"
+                        + "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] patch RC=$PRC | $(echo \"$OUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                        + "[ \"$PRC\" -eq 0 ] || exit $PRC\n"
+                        + "HAS_EFS_CHG=0\n"
+                        + "echo \"$OUT\" | grep -qE 'CHANGED=[1-9]' && HAS_EFS_CHG=1\n"
+                        + "HAS_SIM_CHG=0\n"
+                        + "echo \"$SIM_OUT\" | grep -q 'SIMINFO_NORMALIZED=' && HAS_SIM_CHG=1\n"
+                        + "if [ \"$HAS_EFS_CHG\" -eq 1 ]; then\n"
+                        + "  echo 'VOWIFIX_PHASE:WAIT_FLUSH_6S'\n"
+                        + "  sleep 6\n"
+                        + "  if dumpsys telephony.registry 2>/dev/null | grep -qE 'mCallState=[12]'; then\n"
+                        + "    echo 'ERR_CALL_DURING_WAIT'\n"
+                        + "    exit 2\n"
+                        + "  fi\n"
+                        + "  echo 'VOWIFIX_PHASE:REFRESH_START'\n"
+                        + "  ROUT=$(\"$BIN\" refresh --no-lock 2>&1)\n"
+                        + "  RRC=$?\n"
+                        + "  printf '%s\\n' \"$ROUT\"\n"
+                        + "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] refresh RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                        + "  [ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
+                        + "  exit $RRC\n"
+                        + "elif [ \"$HAS_SIM_CHG\" -eq 1 ]; then\n"
+                        + "  echo 'VOWIFIX_PHASE:REFRESH_START'\n"
+                        + "  ROUT=$(\"$BIN\" refresh --no-lock 2>&1)\n"
+                        + "  RRC=$?\n"
+                        + "  printf '%s\\n' \"$ROUT\"\n"
+                        + "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] siminfo-only refresh RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                        + "  [ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
+                        + "  exit $RRC\n"
+                        + "else\n"
+                        + "  echo 'VOWIFIX_ALREADY_CLEAN=1'\n"
+                        + "fi\n";
+            } else {
+                // 无 Diag 通道（如 GKI 新平台）时降级为校准 siminfo + 纯内核 QRTR 热刷新
+                inner = RootShell.resolveBinarySnippet()
+                        + "[ -n \"$BIN\" ] || { echo 'ERR_NO_BIN'; exit 1; }\n"
+                        + "SIM_OUT=$(\n"
+                        + TelephonyProbe.normalizeSiminfoShellSnippet()
+                        + ")\n"
+                        + "printf '%s\\n' \"$SIM_OUT\"\n"
+                        + "echo 'VOWIFIX_PHASE:REFRESH_START'\n"
+                        + "ROUT=$(\"$BIN\" refresh --no-lock 2>&1)\n"
+                        + "RRC=$?\n"
+                        + "printf '%s\\n' \"$ROUT\"\n"
+                        + "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] upper-only adapt (backend=none) RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                        + "[ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
+                        + "exit $RRC\n";
+            }
 
             RootShell.Result r = RootShell.execRootStreaming(
                     RootShell.wrapWithDiagLock(inner),
@@ -829,7 +879,8 @@ public class MainActivity extends Activity {
     }
 
     private void onRestoreEfsClicked() {
-        if (busy || latestSnapshot == null || !latestSnapshot.hasRoot || !latestSnapshot.binaryAvailable) {
+        if (busy || latestSnapshot == null || !latestSnapshot.hasRoot
+                || !latestSnapshot.binaryAvailable || !latestSnapshot.hasDiagBackend()) {
             return;
         }
         new AlertDialog.Builder(this)
@@ -855,7 +906,9 @@ public class MainActivity extends Activity {
             final boolean allowRefresh = getRemainingRefreshCooldownSec() <= 0;
             String inner = RootShell.resolveBinarySnippet()
                     + "[ -n \"$BIN\" ] || { echo 'ERR_NO_BIN'; exit 1; }\n"
-                    + "[ -c /dev/diag ] || { echo 'ERR_NO_DIAG'; exit 1; }\n"
+                    + "DET=$(\"$BIN\" detect 2>/dev/null | head -n 1)\n"
+                    + "BKD=\"${DET#BACKEND=}\"\n"
+                    + "[ -n \"$BKD\" ] && [ \"$BKD\" != 'none' ] || { echo 'ERR_NO_DIAG'; exit 1; }\n"
                     + "OUT=$(\"$BIN\" restore all --no-lock --backup-dir '" + RootShell.DATA_DIR + "' 2>&1)\n"
                     + "PRC=$?\n"
                     + "printf '%s\\n' \"$OUT\"\n"
@@ -929,7 +982,10 @@ public class MainActivity extends Activity {
         }
 
         if (refreshed) {
-            setBusy(false, actionName + "完成，基带正在重注册（20 秒后自动刷新 EFS 状态）");
+            boolean hasDiag = latestSnapshot != null && latestSnapshot.hasDiagBackend();
+            setBusy(false, hasDiag
+                    ? actionName + "完成，基带正在重注册（20 秒后自动刷新 EFS 状态）"
+                    : actionName + "完成（已校准 siminfo 并触发 QRTR 基带重载）");
             refreshStateAsync(false, true);
         } else if (r.stdout.contains("VOWIFIX_RESTORED_COOLDOWN=1")) {
             setBusy(false, "已还原原始备份并完成 6s 落盘（45s 刷新冷却中，请稍后手动刷新或重启）");
@@ -1097,11 +1153,17 @@ public class MainActivity extends Activity {
     private void updateActionButtonsAvailability() {
         boolean hasRoot = latestSnapshot != null && latestSnapshot.hasRoot;
         boolean hasBin = latestSnapshot != null && latestSnapshot.binaryAvailable;
+        boolean hasDiag = latestSnapshot != null && latestSnapshot.hasDiagBackend();
         boolean canModem = !busy && hasRoot && hasBin;
+        boolean canRestore = canModem && hasDiag;
+
+        if (btnRestoreEfs != null) {
+            btnRestoreEfs.setText((hasRoot && hasBin && !hasDiag) ? "还原备份 (无 Diag)" : "还原原始 EFS 备份");
+        }
 
         UiHelper.applyButtonStyle(this, palette, btnHotAdapt, UiHelper.BTN_PRIMARY, canModem);
         UiHelper.applyButtonStyle(this, palette, btnRefreshModem, UiHelper.BTN_SECONDARY, canModem);
-        UiHelper.applyButtonStyle(this, palette, btnRestoreEfs, UiHelper.BTN_DANGER, canModem);
+        UiHelper.applyButtonStyle(this, palette, btnRestoreEfs, UiHelper.BTN_DANGER, canRestore);
         UiHelper.applyButtonStyle(this, palette, btnRadioInfo, UiHelper.BTN_SECONDARY, !busy);
 
         if (btnRefreshHeader != null) {

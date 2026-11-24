@@ -71,6 +71,8 @@ public final class TelephonyProbe {
     }
 
     public static final class EfsSlotStatus {
+        public static final String STATE_NO_DIAG = "NO_DIAG_BACKEND";
+
         public String iniState = "未读取";
         public String seState = "未读取";
         public String seDetail = "";
@@ -86,6 +88,9 @@ public final class TelephonyProbe {
         }
 
         public String getIniSummaryText() {
+            if (STATE_NO_DIAG.equals(iniState)) {
+                return "配置合并: 未开放 Diag 通道 (仅上层模式)";
+            }
             if ("ALREADY_PATCHED".equals(iniState)) {
                 return "配置合并: 已补丁" + (iniSize > 0 ? " (" + iniSize + " B)" : "");
             }
@@ -102,6 +107,9 @@ public final class TelephonyProbe {
         }
 
         public String getSeSummaryText() {
+            if (STATE_NO_DIAG.equals(seState)) {
+                return "漫游解锁: 由上层配置与原厂 MBN 接管";
+            }
             if ("ALREADY_PATCHED".equals(seState)) {
                 return "漫游解锁: 已解锁" + (seDetail.isEmpty() ? "" : " (" + seDetail + ")");
             }
@@ -125,11 +133,18 @@ public final class TelephonyProbe {
         public boolean binaryAvailable;
         public boolean watcherRunning;
         public boolean watcherEnabled;
+        public String diagBackend = "unknown";
         public String baseband = "";
         public SlotSnapshot[] slots = new SlotSnapshot[2];
         public EfsSlotStatus[] efs = new EfsSlotStatus[]{new EfsSlotStatus(), new EfsSlotStatus()};
         public String serviceLog = "";
         public String errorNote = "";
+
+        public boolean hasDiagBackend() {
+            return diagBackend != null && !diagBackend.isEmpty()
+                    && !"none".equalsIgnoreCase(diagBackend)
+                    && !"unknown".equalsIgnoreCase(diagBackend);
+        }
     }
 
     private static final Pattern INI_LINE = Pattern.compile("^(slot[01]) \\([^)]+\\): (.*)$");
@@ -210,7 +225,7 @@ public final class TelephonyProbe {
     }
 
     /**
-     * 采集完整双端状态；仅当 queryEfs=true 时按需持锁读一次 /dev/diag。
+     * 采集完整双端状态；仅当存在可用 Diag 后端且 queryEfs=true 时按需持锁读一次基带状态。
      */
     public static FullSnapshot collectSnapshot(boolean queryEfs) {
         FullSnapshot snap = new FullSnapshot();
@@ -226,7 +241,7 @@ public final class TelephonyProbe {
             return snap;
         }
 
-        // 先读取纯文件状态与日志（不触碰 /dev/diag）
+        // 先读取纯文件状态、无副作用后端探测与日志（不打开 Diag 通道）
         String metaScript = RootShell.resolveBinarySnippet()
                 + "MOD_OK=0; [ -d '" + RootShell.MODULE_DIR + "' ] && MOD_OK=1\n"
                 + "BIN_OK=0; [ -n \"$BIN\" ] && BIN_OK=1\n"
@@ -238,7 +253,13 @@ public final class TelephonyProbe {
                 + "    tr '\\0' ' ' < \"/proc/$WPID/cmdline\" 2>/dev/null | grep -q 'service.sh' && WATCH_RUN=1\n"
                 + "  fi\n"
                 + "fi\n"
-                + "echo \"META:$MOD_OK:$BIN_OK:$WATCH_EN:$WATCH_RUN\"\n"
+                + "BKD='unknown'\n"
+                + "if [ -n \"$BIN\" ]; then\n"
+                + "  DET=$(\"$BIN\" detect 2>/dev/null | head -n 1)\n"
+                + "  BKD=\"${DET#BACKEND=}\"\n"
+                + "  [ -n \"$BKD\" ] || BKD='none'\n"
+                + "fi\n"
+                + "echo \"META:$MOD_OK:$BIN_OK:$WATCH_EN:$WATCH_RUN:$BKD\"\n"
                 + "echo '===LOG_BEGIN==='\n"
                 + "[ -f '" + RootShell.LOG_PATH + "' ] && tail -n 60 '" + RootShell.LOG_PATH + "' 2>/dev/null\n"
                 + "echo '===LOG_END==='\n";
@@ -250,10 +271,17 @@ public final class TelephonyProbe {
             snap.errorNote = mr.stderr;
         }
 
-        if (queryEfs && snap.binaryAvailable) {
+        if (snap.binaryAvailable && !snap.hasDiagBackend()) {
+            snap.efs[0].iniState = EfsSlotStatus.STATE_NO_DIAG;
+            snap.efs[0].seState = EfsSlotStatus.STATE_NO_DIAG;
+            snap.efs[1].iniState = EfsSlotStatus.STATE_NO_DIAG;
+            snap.efs[1].seState = EfsSlotStatus.STATE_NO_DIAG;
+            return snap;
+        }
+
+        if (queryEfs && snap.binaryAvailable && snap.hasDiagBackend()) {
             String diagCmd = RootShell.resolveBinarySnippet()
                     + "[ -n \"$BIN\" ] || exit 1\n"
-                    + "[ -c /dev/diag ] || { echo 'NO_DIAG'; exit 1; }\n"
                     + RootShell.wrapWithDiagLock("\"$BIN\" status all --no-lock --backup-dir '" + RootShell.DATA_DIR + "' 2>&1");
             RootShell.Result er = RootShell.execRoot(diagCmd, 25);
             if (er.isSuccess()) {
@@ -300,6 +328,9 @@ public final class TelephonyProbe {
                     snap.binaryAvailable = "1".equals(p[2]);
                     snap.watcherEnabled = "1".equals(p[3]);
                     snap.watcherRunning = "1".equals(p[4]);
+                }
+                if (p.length >= 6 && !p[5].trim().isEmpty()) {
+                    snap.diagBackend = p[5].trim();
                 }
             }
         }

@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -19,7 +21,13 @@
 #define DIAG_IOCTL_REGISTER_CALLBACK 37
 
 #define CALLBACK_MODE 6
+#define NO_LOGGING_MODE 7
 #define USER_SPACE_DATA_TYPE 0x20
+
+/* GKI 用户态 diag-router UNIX SEQPACKET 控制信令字 */
+#define DIAG_ROUTER_CMD_REMOTE_DEV 0x33U
+#define DIAG_ROUTER_RSP_REMOTE_DEV 0x00010000U
+#define DIAG_ROUTER_RSP_SWITCH_LOGGING 0x00160000U
 
 /* Diag 基础与 EFS2 子系统命令字 */
 #define DIAG_SUBSYS_CMD 0x4B
@@ -76,6 +84,27 @@ typedef enum {
     DIAG_MODE_LOCAL = 2
 } diag_mode_opt_t;
 
+typedef enum {
+    DIAG_BACKEND_AUTO = 0,
+    DIAG_BACKEND_DIAGCHAR,     /* 传统内核 /dev/diag 字符设备 */
+    DIAG_BACKEND_DIAG_ROUTER,  /* GKI 用户态 diag-router AF_UNIX SOCK_SEQPACKET 通道 */
+    DIAG_BACKEND_LIBDIAG,      /* 预留动态库桥接后端（当前静态版未启用） */
+    DIAG_BACKEND_NONE          /* 无可用 Diag 通道 / 模拟无通道降级 */
+} diag_backend_t;
+
+struct diag_ctx;
+
+/* 多后端 Diag 传输层统一接口表 */
+typedef struct diag_transport_ops {
+    const char *name;
+    diag_backend_t id;
+    int (*detect)(void);
+    int (*open)(struct diag_ctx *ctx, diag_mode_opt_t mode_opt);
+    int (*transact)(const struct diag_ctx *ctx, const uint8_t *cmd, int cmd_len,
+                    uint8_t *rsp_out, int rsp_cap, int timeout_ms);
+    void (*close)(struct diag_ctx *ctx);
+} diag_transport_ops_t;
+
 typedef struct {
     const char *slot_name;
     const char *efs_path;
@@ -111,14 +140,15 @@ static const slot_target_t ALL_SLOTS[] = {
     { "slot1", EFS_PATH_SLOT1, EFS_SE_PATH_SLOT1, "slot1_se" },
 };
 
-typedef struct {
+typedef struct diag_ctx {
     int fd;
     int32_t token;       /* 外挂 MDM 使用 -1，内置 MPSS 使用 0 */
     uint16_t remote_mask;
     int is_remote;
+    const diag_transport_ops_t *ops;
 } diag_ctx_t;
 
-/* ===================== HDLC 与 /dev/diag 通信层 ===================== */
+/* ===================== HDLC 与多后端 Diag 传输层 ===================== */
 
 /* 计算 Qualcomm Diag HDLC 帧校验 CRC-16/CCITT (LSB-first) */
 static uint16_t crc16_ccitt(const uint8_t *data, int len) {
@@ -195,9 +225,20 @@ static int match_response(const uint8_t *cmd, int cmd_len, const uint8_t *rsp, i
     return 1;
 }
 
+/* 无副作用轻量探测 /dev/diag 字符设备是否存在（不切换 logging mode） */
+static int diagchar_detect(void) {
+    struct stat st;
+    if (stat("/dev/diag", &st) != 0) return 0;
+    return S_ISCHR(st.st_mode) ? 1 : 0;
+}
+
 /* 自动或按需开启 /dev/diag 并切换到对应外挂 MDM 或内置 MPSS 的 CALLBACK 模式 */
-static int diag_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
-    memset(ctx, 0, sizeof(*ctx));
+static int diagchar_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
+    ctx->fd = -1;
+    ctx->token = 0;
+    ctx->remote_mask = 0;
+    ctx->is_remote = 0;
+
     ctx->fd = open("/dev/diag", O_RDWR | O_CLOEXEC);
     if (ctx->fd < 0) {
         fprintf(stderr, "open(/dev/diag) failed: errno=%d (%s)\n", errno, strerror(errno));
@@ -241,16 +282,16 @@ static int diag_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
     return 0;
 }
 
-static void diag_close(diag_ctx_t *ctx) {
+static void diagchar_close(diag_ctx_t *ctx) {
     if (ctx && ctx->fd >= 0) {
         close(ctx->fd);
         ctx->fd = -1;
     }
 }
 
-/* 向目标基带通道收发单条同步 Diag 指令 */
-static int diag_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
-                         uint8_t *rsp_out, int rsp_cap, int timeout_ms) {
+/* 向 /dev/diag 目标基带通道收发单条同步 Diag 指令 */
+static int diagchar_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
+                             uint8_t *rsp_out, int rsp_cap, int timeout_ms) {
     uint8_t send_buf[4096];
     uint8_t payload[4096];
     int pay_len = build_hdlc(cmd, cmd_len, payload, sizeof(payload));
@@ -324,6 +365,484 @@ static int diag_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
         }
     }
     return -1;
+}
+
+/* ===================== GKI diag-router SOCK_SEQPACKET 后端 ===================== */
+
+/* 构造 diag-router 的 DIAG_IOCTL_SWITCH_LOGGING (data_type=7) 32 字节请求帧（末尾含 4B PID） */
+static void diag_router_build_switch_logging_req(uint32_t req_mode, int is_remote,
+                                                 uint16_t remote_mask, int32_t pid,
+                                                 uint8_t out[32]) {
+    memset(out, 0, 32);
+    uint32_t dt = DIAG_IOCTL_SWITCH_LOGGING;
+    struct diag_logging_mode_param_t mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.req_mode = req_mode;
+    mode.peripheral_mask = 0xFFF;
+    mode.pd_mask = 0;
+    mode.mode_param = 1;
+    mode.diag_id = -22;
+    mode.pd_val = is_remote ? (1u | (((uint32_t)remote_mask) << 1)) : 1u;
+
+    int32_t eff_pid = (pid >= 1) ? pid : 1;
+    memcpy(out, &dt, 4);
+    memcpy(out + 4, &mode, sizeof(mode));
+    memcpy(out + 28, &eff_pid, 4);
+}
+
+/* 构造发往 diag-router 的 USER_SPACE_DATA_TYPE (0x20) 请求包：
+ * 内置 MPSS (is_remote=0) 为 [0x20][HDLC]（严禁插入 4B token=0）；
+ * 外挂 MDM (is_remote=1) 为 [0x20][token=-1][HDLC]。 */
+static int diag_router_build_tx_pkt(int is_remote, int32_t token,
+                                    const uint8_t *cmd, int cmd_len,
+                                    uint8_t *out, int out_cap) {
+    uint8_t payload[4096];
+    int pay_len = build_hdlc(cmd, cmd_len, payload, (int)sizeof(payload));
+    if (pay_len < 0) return -1;
+
+    int hdr_len = is_remote ? 8 : 4;
+    if (hdr_len + pay_len > out_cap) return -1;
+
+    uint32_t dt = USER_SPACE_DATA_TYPE;
+    memcpy(out, &dt, 4);
+    if (is_remote) {
+        memcpy(out + 4, &token, 4);
+    }
+    memcpy(out + hdr_len, payload, (size_t)pay_len);
+    return hdr_len + pay_len;
+}
+
+/* 解析 diag-router 返回的单条 SEQPACKET 数据报：
+ * 返回 >0 为匹配的响应净荷长度，0 表示广播/未匹配包或分片待续，-1 表示匹配的 Diag 错误响应。 */
+static int diag_router_parse_rx_pkt(int is_remote, int32_t expected_token,
+                                    const uint8_t *rbuf, int n,
+                                    const uint8_t *cmd, int cmd_len,
+                                    uint8_t *acc, int *acc_len, int acc_cap,
+                                    uint8_t *rsp_out, int rsp_cap) {
+    if (!rbuf || !acc || !acc_len || !rsp_out || n < 12) return 0;
+
+    uint32_t r_dt = 0;
+    uint32_t num_pkts = 0;
+    memcpy(&r_dt, rbuf, 4);
+    memcpy(&num_pkts, rbuf + 4, 4);
+    if (r_dt != USER_SPACE_DATA_TYPE || num_pkts == 0 || num_pkts > 64) {
+        return 0;
+    }
+
+    int off = 8;
+    for (uint32_t p = 0; p < num_pkts; p++) {
+        int32_t pkt_tok = 0;
+        uint32_t pkt_len = 0;
+        if (is_remote) {
+            if (off + 8 > n) break;
+            memcpy(&pkt_tok, rbuf + off, 4);
+            memcpy(&pkt_len, rbuf + off + 4, 4);
+            off += 8;
+        } else {
+            if (off + 4 > n) break;
+            memcpy(&pkt_len, rbuf + off, 4);
+            off += 4;
+        }
+
+        if (pkt_len == 0 || pkt_len > (uint32_t)(n - off)) break;
+
+        if (!is_remote || pkt_tok == expected_token) {
+            if (*acc_len + (int)pkt_len > acc_cap) *acc_len = 0;
+            memcpy(acc + *acc_len, rbuf + off, pkt_len);
+            *acc_len += (int)pkt_len;
+
+            int start = 0;
+            for (int i = 0; i < *acc_len; i++) {
+                if (acc[i] == 0x7E) {
+                    if (i > start) {
+                        uint8_t cand[8192];
+                        int clen = unwrap_one_hdlc_with_crc(acc + start, i - start,
+                                                            cand, (int)sizeof(cand));
+                        int is_err = 0;
+                        if (clen > 0 && match_response(cmd, cmd_len, cand, clen, &is_err)) {
+                            if (is_err) return -1;
+                            int copy_n = clen < rsp_cap ? clen : rsp_cap;
+                            memcpy(rsp_out, cand, (size_t)copy_n);
+                            return copy_n;
+                        }
+                    }
+                    start = i + 1;
+                }
+            }
+            if (start > 0 && start <= *acc_len) {
+                memmove(acc, acc + start, (size_t)(*acc_len - start));
+                *acc_len -= start;
+            }
+        }
+        off += (int)pkt_len;
+    }
+    return 0;
+}
+
+static long diag_router_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+}
+
+/* 连接高通 GKI diag-router 抽象命名空间 UNIX SOCK_SEQPACKET 套接字 */
+static int diag_router_connect_socket(int timeout_ms) {
+#ifdef __linux__
+    struct sockaddr_un addrs[3];
+    socklen_t lens[3];
+
+    /* 候选 1：全零 108B 抽象命名空间（匹配高通 strlcpy("\0diag") 实测 bind 行为） */
+    memset(&addrs[0], 0, sizeof(addrs[0]));
+    addrs[0].sun_family = AF_UNIX;
+    lens[0] = (socklen_t)sizeof(addrs[0]);
+
+    /* 候选 2/3：兼容 "\0diag" 紧凑长度与完整 sockaddr_un 长度 */
+    memset(&addrs[1], 0, sizeof(addrs[1]));
+    addrs[1].sun_family = AF_UNIX;
+    memcpy(addrs[1].sun_path, "\0diag", 5);
+    lens[1] = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 5);
+
+    addrs[2] = addrs[1];
+    lens[2] = (socklen_t)sizeof(addrs[2]);
+
+    for (int i = 0; i < 3; i++) {
+        int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        if (fd < 0) return -1;
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int rc = connect(fd, (const struct sockaddr *)&addrs[i], lens[i]);
+        if (rc < 0 && (errno == EINPROGRESS || errno == EAGAIN)) {
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            if (poll(&pfd, 1, timeout_ms) > 0) {
+                int so_err = 0;
+                socklen_t elen = sizeof(so_err);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &elen) == 0 && so_err == 0) {
+                    rc = 0;
+                }
+            }
+        }
+        if (rc == 0) {
+            if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+            return fd;
+        }
+        close(fd);
+    }
+    return -1;
+#else
+    (void)timeout_ms;
+    return -1;
+#endif
+}
+
+/* 跳过 diag-router 建连广播帧并等待目标控制应答包 */
+static int diag_router_recv_ctrl(int fd, uint32_t expected_type,
+                                 uint8_t *out, size_t min_len, size_t cap, int timeout_ms) {
+    uint8_t buf[16384];
+    long deadline = diag_router_now_ms() + timeout_ms;
+
+    for (;;) {
+        long rem = deadline - diag_router_now_ms();
+        if (rem <= 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, (int)rem);
+        if (pr <= 0) break;
+
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        if ((size_t)n < min_len || (size_t)n < 4) continue;
+
+        uint32_t dt = 0;
+        memcpy(&dt, buf, 4);
+        if (dt == expected_type) {
+            size_t cp = ((size_t)n < cap) ? (size_t)n : cap;
+            memcpy(out, buf, cp);
+            return (int)cp;
+        }
+    }
+    return -1;
+}
+
+static int diag_router_detect(void) {
+    int fd = diag_router_connect_socket(200);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+
+static int diag_router_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
+    ctx->fd = -1;
+    ctx->token = 0;
+    ctx->remote_mask = 0;
+    ctx->is_remote = 0;
+
+    ctx->fd = diag_router_connect_socket(1000);
+    if (ctx->fd < 0) {
+        fprintf(stderr, "connect(diag-router) failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    uint16_t remote_mask = 0;
+    uint32_t q_remote = DIAG_ROUTER_CMD_REMOTE_DEV;
+    uint8_t ctrl_rsp[64];
+    if (write(ctx->fd, &q_remote, sizeof(q_remote)) == (ssize_t)sizeof(q_remote)) {
+        if (diag_router_recv_ctrl(ctx->fd, DIAG_ROUTER_RSP_REMOTE_DEV,
+                                  ctrl_rsp, 6, sizeof(ctrl_rsp), 800) >= 6) {
+            memcpy(&remote_mask, ctrl_rsp + 4, 2);
+        }
+    }
+    ctx->remote_mask = remote_mask;
+
+    if (mode_opt == DIAG_MODE_REMOTE) {
+        ctx->is_remote = 1;
+        if (remote_mask == 0) remote_mask = 1;
+    } else if (mode_opt == DIAG_MODE_LOCAL) {
+        ctx->is_remote = 0;
+    } else {
+        ctx->is_remote = (remote_mask != 0) ? 1 : 0;
+    }
+    ctx->token = ctx->is_remote ? -1 : 0;
+
+    uint8_t sw_req[32];
+    int32_t self_pid = (int32_t)getpid();
+    diag_router_build_switch_logging_req(CALLBACK_MODE, ctx->is_remote, remote_mask,
+                                         self_pid, sw_req);
+    if (write(ctx->fd, sw_req, sizeof(sw_req)) != (ssize_t)sizeof(sw_req)) {
+        fprintf(stderr, "diag-router write(switch_logging) failed: errno=%d (%s)\n",
+                errno, strerror(errno));
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+
+    if (diag_router_recv_ctrl(ctx->fd, DIAG_ROUTER_RSP_SWITCH_LOGGING,
+                              ctrl_rsp, 8, sizeof(ctrl_rsp), 1500) < 8) {
+        fprintf(stderr, "diag-router switch_logging timed out\n");
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+    int32_t sw_status = -1;
+    memcpy(&sw_status, ctrl_rsp + 4, 4);
+    if (sw_status != 0) {
+        fprintf(stderr, "diag-router switch_logging failed: status=%d\n", sw_status);
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static int diag_router_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
+                                uint8_t *rsp_out, int rsp_cap, int timeout_ms) {
+    uint8_t send_buf[4096];
+    int tx_len = diag_router_build_tx_pkt(ctx->is_remote, ctx->token,
+                                          cmd, cmd_len, send_buf, (int)sizeof(send_buf));
+    if (tx_len < 0) return -1;
+
+    if (write(ctx->fd, send_buf, (size_t)tx_len) != (ssize_t)tx_len) {
+        fprintf(stderr, "diag-router write failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    static uint8_t rbuf[65536];
+    static uint8_t acc[65536];
+    int acc_len = 0;
+    long deadline = diag_router_now_ms() + timeout_ms;
+
+    for (;;) {
+        long rem = deadline - diag_router_now_ms();
+        if (rem <= 0) break;
+        struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, (int)rem);
+        if (pr <= 0) break;
+
+        ssize_t n = read(ctx->fd, rbuf, sizeof(rbuf));
+        if (n <= 0) break;
+
+        int parsed = diag_router_parse_rx_pkt(ctx->is_remote, ctx->token, rbuf, (int)n,
+                                              cmd, cmd_len, acc, &acc_len, (int)sizeof(acc),
+                                              rsp_out, rsp_cap);
+        if (parsed != 0) return parsed;
+    }
+    return -1;
+}
+
+static void diag_router_close(diag_ctx_t *ctx) {
+    if (ctx && ctx->fd >= 0) {
+        uint8_t sw_req[32];
+        uint8_t rsp[32];
+        uint16_t rmask = (ctx->is_remote && ctx->remote_mask == 0) ? 1 : ctx->remote_mask;
+        diag_router_build_switch_logging_req(NO_LOGGING_MODE, ctx->is_remote, rmask,
+                                             (int32_t)getpid(), sw_req);
+        if (write(ctx->fd, sw_req, sizeof(sw_req)) == (ssize_t)sizeof(sw_req)) {
+            (void)diag_router_recv_ctrl(ctx->fd, DIAG_ROUTER_RSP_SWITCH_LOGGING,
+                                        rsp, 8, sizeof(rsp), 100);
+        }
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+}
+
+/* 预留动态库桥接后端占位实现（当前静态版未启用，使用 diagchar 或 diag-router） */
+static int placeholder_backend_detect(void) {
+    return 0;
+}
+
+static int placeholder_backend_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
+    (void)mode_opt;
+    const char *name = (ctx && ctx->ops && ctx->ops->name) ? ctx->ops->name : "unknown";
+    fprintf(stderr, "diag backend '%s' is not enabled in static build (use diagchar or diag-router)\n", name);
+    return -1;
+}
+
+static int placeholder_backend_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
+                                        uint8_t *rsp_out, int rsp_cap, int timeout_ms) {
+    (void)ctx;
+    (void)cmd;
+    (void)cmd_len;
+    (void)rsp_out;
+    (void)rsp_cap;
+    (void)timeout_ms;
+    return -1;
+}
+
+static void placeholder_backend_close(diag_ctx_t *ctx) {
+    if (ctx && ctx->fd >= 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+}
+
+static const diag_transport_ops_t DIAGCHAR_OPS = {
+    .name = "diagchar",
+    .id = DIAG_BACKEND_DIAGCHAR,
+    .detect = diagchar_detect,
+    .open = diagchar_open,
+    .transact = diagchar_transact,
+    .close = diagchar_close,
+};
+
+static const diag_transport_ops_t DIAG_ROUTER_OPS = {
+    .name = "diag-router",
+    .id = DIAG_BACKEND_DIAG_ROUTER,
+    .detect = diag_router_detect,
+    .open = diag_router_open,
+    .transact = diag_router_transact,
+    .close = diag_router_close,
+};
+
+static const diag_transport_ops_t LIBDIAG_OPS = {
+    .name = "libdiag",
+    .id = DIAG_BACKEND_LIBDIAG,
+    .detect = placeholder_backend_detect,
+    .open = placeholder_backend_open,
+    .transact = placeholder_backend_transact,
+    .close = placeholder_backend_close,
+};
+
+static const diag_transport_ops_t *const ALL_DIAG_BACKENDS[] = {
+    &DIAGCHAR_OPS,
+    &DIAG_ROUTER_OPS,
+    &LIBDIAG_OPS,
+};
+
+/* 解析命令行 --backend 参数值 */
+static int parse_diag_backend(const char *arg, diag_backend_t *out) {
+    if (!arg || !out) return -1;
+    if (strcmp(arg, "auto") == 0) {
+        *out = DIAG_BACKEND_AUTO;
+        return 0;
+    }
+    if (strcmp(arg, "diagchar") == 0) {
+        *out = DIAG_BACKEND_DIAGCHAR;
+        return 0;
+    }
+    if (strcmp(arg, "diag-router") == 0 || strcmp(arg, "diag_router") == 0) {
+        *out = DIAG_BACKEND_DIAG_ROUTER;
+        return 0;
+    }
+    if (strcmp(arg, "libdiag") == 0) {
+        *out = DIAG_BACKEND_LIBDIAG;
+        return 0;
+    }
+    if (strcmp(arg, "none") == 0) {
+        *out = DIAG_BACKEND_NONE;
+        return 0;
+    }
+    return -1;
+}
+
+static const diag_transport_ops_t *find_diag_backend_by_id(diag_backend_t id) {
+    size_t n = sizeof(ALL_DIAG_BACKENDS) / sizeof(ALL_DIAG_BACKENDS[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (ALL_DIAG_BACKENDS[i]->id == id) {
+            return ALL_DIAG_BACKENDS[i];
+        }
+    }
+    return NULL;
+}
+
+/* 按优先级无副作用探测当前设备可用的 Diag 后端；若无可用通道返回 NULL */
+static const diag_transport_ops_t *resolve_diag_backend(diag_backend_t req) {
+    if (req == DIAG_BACKEND_NONE) return NULL;
+    if (req == DIAG_BACKEND_AUTO) {
+        size_t n = sizeof(ALL_DIAG_BACKENDS) / sizeof(ALL_DIAG_BACKENDS[0]);
+        for (size_t i = 0; i < n; i++) {
+            if (ALL_DIAG_BACKENDS[i]->detect && ALL_DIAG_BACKENDS[i]->detect()) {
+                return ALL_DIAG_BACKENDS[i];
+            }
+        }
+        return NULL;
+    }
+    const diag_transport_ops_t *ops = find_diag_backend_by_id(req);
+    if (ops && ops->detect && ops->detect()) {
+        return ops;
+    }
+    return NULL;
+}
+
+/* 通过多后端虚表开启 Diag 会话 */
+static int diag_open(diag_ctx_t *ctx, diag_backend_t req_backend, diag_mode_opt_t mode_opt) {
+    if (!ctx) return -1;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->fd = -1;
+
+    if (req_backend == DIAG_BACKEND_NONE) {
+        fprintf(stderr, "diag backend disabled (--backend=none)\n");
+        return -1;
+    }
+
+    const diag_transport_ops_t *ops = (req_backend == DIAG_BACKEND_AUTO)
+        ? resolve_diag_backend(DIAG_BACKEND_AUTO)
+        : find_diag_backend_by_id(req_backend);
+    if (!ops) {
+        fprintf(stderr, "no available Diag backend detected (neither /dev/diag nor diag-router reachable)\n");
+        return -1;
+    }
+
+    ctx->ops = ops;
+    if (!ops->open || ops->open(ctx, mode_opt) != 0) {
+        ctx->ops = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int diag_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
+                         uint8_t *rsp_out, int rsp_cap, int timeout_ms) {
+    if (!ctx || !ctx->ops || !ctx->ops->transact) return -1;
+    return ctx->ops->transact(ctx, cmd, cmd_len, rsp_out, rsp_cap, timeout_ms);
+}
+
+static void diag_close(diag_ctx_t *ctx) {
+    if (ctx && ctx->ops && ctx->ops->close) {
+        ctx->ops->close(ctx);
+    }
+    if (ctx) {
+        ctx->ops = NULL;
+    }
 }
 
 /* 封装发送 EFS2 子系统命令 */
@@ -1411,7 +1930,126 @@ static int run_self_tests(void) {
         fprintf(stderr, "FAIL T7 whitelist check\n"); return 1;
     }
 
-    printf("SELF-TEST PASSED: all 7 INI/SE merge & QMI refresh cases OK\n");
+    /* 用例 8：多后端解析、探测规则与传输虚表空保护校验 */
+    diag_backend_t bk = DIAG_BACKEND_AUTO;
+    if (parse_diag_backend("auto", &bk) != 0 || bk != DIAG_BACKEND_AUTO ||
+        parse_diag_backend("diagchar", &bk) != 0 || bk != DIAG_BACKEND_DIAGCHAR ||
+        parse_diag_backend("diag-router", &bk) != 0 || bk != DIAG_BACKEND_DIAG_ROUTER ||
+        parse_diag_backend("diag_router", &bk) != 0 || bk != DIAG_BACKEND_DIAG_ROUTER ||
+        parse_diag_backend("libdiag", &bk) != 0 || bk != DIAG_BACKEND_LIBDIAG ||
+        parse_diag_backend("none", &bk) != 0 || bk != DIAG_BACKEND_NONE) {
+        fprintf(stderr, "FAIL T8 parse valid backend\n"); return 1;
+    }
+    if (parse_diag_backend(NULL, &bk) == 0 || parse_diag_backend("", &bk) == 0 ||
+        parse_diag_backend("unknown_drv", &bk) == 0) {
+        fprintf(stderr, "FAIL T8 reject invalid backend\n"); return 1;
+    }
+    if (resolve_diag_backend(DIAG_BACKEND_NONE) != NULL ||
+        resolve_diag_backend(DIAG_BACKEND_DIAG_ROUTER) != (DIAG_ROUTER_OPS.detect() ? &DIAG_ROUTER_OPS : NULL) ||
+        resolve_diag_backend(DIAG_BACKEND_LIBDIAG) != NULL ||
+        LIBDIAG_OPS.detect() != 0) {
+        fprintf(stderr, "FAIL T8 resolve guard\n"); return 1;
+    }
+    diag_ctx_t empty_ctx;
+    memset(&empty_ctx, 0, sizeof(empty_ctx));
+    empty_ctx.fd = -1;
+    uint8_t dummy_cmd = DIAG_EXT_BUILD_ID;
+    uint8_t dummy_rsp[16];
+    if (diag_transact(&empty_ctx, &dummy_cmd, 1, dummy_rsp, sizeof(dummy_rsp), 10) != -1 ||
+        diag_transact(NULL, &dummy_cmd, 1, dummy_rsp, sizeof(dummy_rsp), 10) != -1) {
+        fprintf(stderr, "FAIL T8 null ops transact guard\n"); return 1;
+    }
+    diag_close(&empty_ctx);
+    diag_close(NULL);
+
+    /* 用例 9：GKI diag-router 协议封包/解包（32B switch_logging、无 token 12B 内置头 vs 16B 外挂头）校验 */
+    uint8_t sw_local[32], sw_remote[32];
+    diag_router_build_switch_logging_req(CALLBACK_MODE, 0, 0, 12345, sw_local);
+    uint32_t sw_dt = 0, sw_reqm = 0, sw_pmask = 0, sw_pdv = 0;
+    int32_t sw_id = 0, sw_pid = 0;
+    memcpy(&sw_dt, sw_local, 4);
+    memcpy(&sw_reqm, sw_local + 4, 4);
+    memcpy(&sw_pmask, sw_local + 8, 4);
+    memcpy(&sw_id, sw_local + 20, 4);
+    memcpy(&sw_pdv, sw_local + 24, 4);
+    memcpy(&sw_pid, sw_local + 28, 4);
+    if (sw_dt != DIAG_IOCTL_SWITCH_LOGGING || sw_reqm != CALLBACK_MODE ||
+        sw_pmask != 0xFFFU || sw_id != -22 || sw_pdv != 1u || sw_pid != 12345) {
+        fprintf(stderr, "FAIL T9 switch_logging local encode\n"); return 1;
+    }
+    diag_router_build_switch_logging_req(NO_LOGGING_MODE, 1, 0x03, 0, sw_remote);
+    memcpy(&sw_reqm, sw_remote + 4, 4);
+    memcpy(&sw_pdv, sw_remote + 24, 4);
+    memcpy(&sw_pid, sw_remote + 28, 4);
+    if (sw_reqm != NO_LOGGING_MODE || sw_pdv != 7u || sw_pid != 1) {
+        fprintf(stderr, "FAIL T9 switch_logging remote & pid guard\n"); return 1;
+    }
+
+    uint8_t tx_buf[64];
+    int tx_loc_len = diag_router_build_tx_pkt(0, 0, &dummy_cmd, 1, tx_buf, (int)sizeof(tx_buf));
+    if (tx_loc_len != 8 || tx_buf[0] != USER_SPACE_DATA_TYPE || tx_buf[4] != DIAG_EXT_BUILD_ID || tx_buf[7] != 0x7E) {
+        fprintf(stderr, "FAIL T9 local tx must omit token\n"); return 1;
+    }
+    int tx_rem_len = diag_router_build_tx_pkt(1, -1, &dummy_cmd, 1, tx_buf, (int)sizeof(tx_buf));
+    int32_t tx_tok = 0;
+    memcpy(&tx_tok, tx_buf + 4, 4);
+    if (tx_rem_len != 12 || tx_buf[0] != USER_SPACE_DATA_TYPE || tx_tok != -1 || tx_buf[8] != DIAG_EXT_BUILD_ID) {
+        fprintf(stderr, "FAIL T9 remote tx token mismatch\n"); return 1;
+    }
+
+    /* 构造 EFS2 STAT 请求及模拟响应并验证 12B 内置头 vs 16B 外挂头与广播过滤 */
+    const uint8_t stat_cmd[4] = { DIAG_SUBSYS_CMD, DIAG_SUBSYS_FS, EFS2_DIAG_STAT, 0x00 };
+    const uint8_t stat_raw_rsp[8] = { DIAG_SUBSYS_CMD, DIAG_SUBSYS_FS, EFS2_DIAG_STAT, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    uint8_t stat_hdlc[64];
+    int stat_hdlc_len = build_hdlc(stat_raw_rsp, (int)sizeof(stat_raw_rsp), stat_hdlc, (int)sizeof(stat_hdlc));
+    if (stat_hdlc_len <= 0) { fprintf(stderr, "FAIL T9 build hdlc\n"); return 1; }
+
+    uint8_t acc_test[256];
+    int acc_len = 0;
+    uint8_t rsp_parsed[64];
+    uint8_t bcast[16];
+    memset(bcast, 0, sizeof(bcast));
+    uint32_t btype = 0x00320000U;
+    memcpy(bcast, &btype, 4);
+    if (diag_router_parse_rx_pkt(0, 0, bcast, (int)sizeof(bcast), stat_cmd, 4,
+                                 acc_test, &acc_len, (int)sizeof(acc_test), rsp_parsed, (int)sizeof(rsp_parsed)) != 0) {
+        fprintf(stderr, "FAIL T9 ignore non-0x20 packet\n"); return 1;
+    }
+
+    uint8_t rx_local[128];
+    uint32_t u_dt = USER_SPACE_DATA_TYPE, u_cnt = 1, u_plen = (uint32_t)stat_hdlc_len;
+    memcpy(rx_local, &u_dt, 4);
+    memcpy(rx_local + 4, &u_cnt, 4);
+    memcpy(rx_local + 8, &u_plen, 4);
+    memcpy(rx_local + 12, stat_hdlc, (size_t)stat_hdlc_len);
+    acc_len = 0;
+    int got_loc = diag_router_parse_rx_pkt(0, 0, rx_local, 12 + stat_hdlc_len, stat_cmd, 4,
+                                           acc_test, &acc_len, (int)sizeof(acc_test), rsp_parsed, (int)sizeof(rsp_parsed));
+    if (got_loc != (int)sizeof(stat_raw_rsp) || memcmp(rsp_parsed, stat_raw_rsp, sizeof(stat_raw_rsp)) != 0) {
+        fprintf(stderr, "FAIL T9 local 12B rx parse\n"); return 1;
+    }
+
+    uint8_t rx_remote[128];
+    int32_t tok_neg1 = -1, tok_neg2 = -2;
+    memcpy(rx_remote, &u_dt, 4);
+    memcpy(rx_remote + 4, &u_cnt, 4);
+    memcpy(rx_remote + 8, &tok_neg2, 4);
+    memcpy(rx_remote + 12, &u_plen, 4);
+    memcpy(rx_remote + 16, stat_hdlc, (size_t)stat_hdlc_len);
+    acc_len = 0;
+    if (diag_router_parse_rx_pkt(1, -1, rx_remote, 16 + stat_hdlc_len, stat_cmd, 4,
+                                 acc_test, &acc_len, (int)sizeof(acc_test), rsp_parsed, (int)sizeof(rsp_parsed)) != 0) {
+        fprintf(stderr, "FAIL T9 remote token filter\n"); return 1;
+    }
+    memcpy(rx_remote + 8, &tok_neg1, 4);
+    acc_len = 0;
+    int got_rem = diag_router_parse_rx_pkt(1, -1, rx_remote, 16 + stat_hdlc_len, stat_cmd, 4,
+                                           acc_test, &acc_len, (int)sizeof(acc_test), rsp_parsed, (int)sizeof(rsp_parsed));
+    if (got_rem != (int)sizeof(stat_raw_rsp) || memcmp(rsp_parsed, stat_raw_rsp, sizeof(stat_raw_rsp)) != 0) {
+        fprintf(stderr, "FAIL T9 remote 16B rx parse\n"); return 1;
+    }
+
+    printf("SELF-TEST PASSED: all 9 INI/SE merge, diag-router/diagchar transport & QMI refresh cases OK\n");
     return 0;
 }
 
@@ -1467,6 +2105,7 @@ int main(int argc, char **argv) {
     int ils_only = 0;
     int no_lock = 0;
     diag_mode_opt_t mode_opt = DIAG_MODE_AUTO;
+    diag_backend_t backend_opt = DIAG_BACKEND_AUTO;
     const char *backup_dir = DEFAULT_BACKUP_DIR;
 
     const char *pos_args[8];
@@ -1482,6 +2121,17 @@ int main(int argc, char **argv) {
             mode_opt = DIAG_MODE_REMOTE;
         } else if (strcmp(argv[i], "--local") == 0) {
             mode_opt = DIAG_MODE_LOCAL;
+        } else if (strncmp(argv[i], "--backend=", 10) == 0) {
+            if (parse_diag_backend(argv[i] + 10, &backend_opt) != 0) {
+                fprintf(stderr, "Invalid --backend value: %s\n", argv[i] + 10);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 >= argc || parse_diag_backend(argv[i + 1], &backend_opt) != 0) {
+                fprintf(stderr, "Invalid or missing --backend argument\n");
+                return 2;
+            }
+            i++;
         } else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc) {
             backup_dir = argv[++i];
         } else if (pos_argc < 8) {
@@ -1491,8 +2141,9 @@ int main(int argc, char **argv) {
 
     if (pos_argc < 1) {
         fprintf(stderr,
-                "Usage: %s [--ils-only] [--no-lock] [--remote|--local] [--backup-dir <dir>] "
-                "probe|status [slot0|slot1|all]|patch [slot0|slot1|all]|restore [slot0|slot1|all]|"
+                "Usage: %s [--ils-only] [--no-lock] [--remote|--local] "
+                "[--backend=auto|diagchar|diag-router|libdiag|none] [--backup-dir <dir>] "
+                "detect|probe|status [slot0|slot1|all]|patch [slot0|slot1|all]|restore [slot0|slot1|all]|"
                 "refresh [cfg act]|stat <efs_path>|read <efs_path> <local_out>|--self-test\n",
                 argv[0]);
         return 2;
@@ -1500,14 +2151,21 @@ int main(int argc, char **argv) {
 
     const char *cmd = pos_args[0];
 
-    /* 获取与守护进程和 App 共享的互斥锁，保障 /dev/diag 与 QMI 刷新严格串行 */
+    /* detect 为纯无副作用、无锁探测：不抢占 diag.lock 也不切换基带 logging mode */
+    if (strcmp(cmd, "detect") == 0) {
+        const diag_transport_ops_t *ops = resolve_diag_backend(backend_opt);
+        printf("BACKEND=%s\n", ops ? ops->name : "none");
+        return 0;
+    }
+
+    /* 获取与守护进程和 App 共享的互斥锁，保障 Diag 通道与 QMI 刷新严格串行 */
     int lock_fd = -1;
     if (!no_lock) {
         lock_fd = acquire_diag_lock(DEFAULT_LOCK_PATH);
         if (lock_fd < 0) return 1;
     }
 
-    /* refresh 走纯内核 QRTR 通路，严禁打开 /dev/diag，避免与刚落盘或重启的基带产生并发冲突 */
+    /* refresh 走纯内核 QRTR 通路，严禁打开 Diag 通道，避免与刚落盘或重启的基带产生并发冲突 */
     if (strcmp(cmd, "refresh") == 0) {
         uint32_t cfg = MCFG_TYPE_SW;
         uint32_t act = MCFG_ACTIVATION_REFRESH_ONLY;
@@ -1531,7 +2189,7 @@ int main(int argc, char **argv) {
         : (sizeof(UNIVERSAL_PATCHES) / sizeof(UNIVERSAL_PATCHES[0]));
 
     diag_ctx_t ctx;
-    if (diag_open(&ctx, mode_opt) != 0) {
+    if (diag_open(&ctx, backend_opt, mode_opt) != 0) {
         if (lock_fd >= 0) close(lock_fd);
         return 1;
     }
@@ -1541,7 +2199,8 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "probe") == 0) {
         uint8_t rsp[512], ext_id = DIAG_EXT_BUILD_ID;
         int r = diag_transact(&ctx, &ext_id, 1, rsp, sizeof(rsp), 1500);
-        printf("mode=%s remote_mask=0x%04x ext_build_id_len=%d sw=%s\n",
+        printf("backend=%s mode=%s remote_mask=0x%04x ext_build_id_len=%d sw=%s\n",
+               ctx.ops ? ctx.ops->name : "unknown",
                ctx.is_remote ? "remote_mdm" : "local_mpss",
                ctx.remote_mask, r, (r > 12) ? (const char *)(rsp + 12) : "<none>");
         rc = (r > 12) ? 0 : 1;

@@ -9,10 +9,11 @@ VoWiFiX 将 **Root 基带 EFS 层工具**（`vowifix-efs` + 切卡自动守护�
 ## 核心特性
 
 - **双层基带 EFS 安全合并与漫游解锁**
-  - 通过高通 `/dev/diag` (`EFS2_DIAG_*`) 对 `/efsprofiles/overideconfig`（及双卡副槽 `_Subscription01`）执行只增不毁、逐字节校验的 `6` 键通用配置合并，保留各卡原有 APN/端口/加密策略不变；
+  - 原生支持高通传统 `/dev/diag` (`diagchar`) 与 GKI 新平台 `diag-router`（`AF_UNIX` `SOCK_SEQPACKET`）双后端自动探测（`EFS2_DIAG_*`），对 `/efsprofiles/overideconfig`（及双卡副槽 `_Subscription01`）执行只增不毁、逐字节校验的 `6` 键通用配置合并，保留各卡原有 APN/端口/加密策略不变；
   - 同步对活跃槽位 `/nv/item_files/ims/qp_ims_service_enablement_config` 执行最小 `3` 字节解锁（启用 Wi-Fi 通话总开关、将移动网络优先改回 Wi-Fi 优先、解除漫游强制禁用 VoWiFi），破除部分海外或漫游 SIM 卡的基带硬锁。
 - **跨卡热切换免重启自适应**
-  - 常驻守护进程监听双卡 `gsm.sim.state` 与 `MCC/MNC` 变动，在切卡或漫游就绪后自动完成 EFS 合并、`telephony/siminfo` 历史策略校准，并通过 Qualcomm `QRTR` (`AF_QIPCRTR`) 原生下发 `QMI_VS` (`0x008e`) 热刷新基带配置，无需重启即可生效。
+  - 常驻守护进程监听双卡 `gsm.sim.state` 与 `MCC/MNC` 变动，在切卡或漫游就绪后自动完成 EFS 合并、`telephony/siminfo` 历史策略校准，并通过 Qualcomm `QRTR` (`AF_QIPCRTR`) 原生下发 `QMI_VS` (`0x008e`) 热刷新基带配置，无需重启即可生效；
+  - 自 `v1.0.1` 起引入多后端 Diag 传输层抽象与无副作用探测（`vowifix-efs detect`）：单文件静态二进制即可自动适配旧平台 `/dev/diag` 与骁龙 8 Gen 2 / 8 Gen 3 / 8 Elite 等 GKI 新平台的 `diag-router`；对极少数完全封禁 Diag 的商用 ROM 也会优雅切换至“上层解锁 + `siminfo` 校准 + QRTR 刷新”模式，消除开机等待超时与报错刷屏。
 - **LSPosed 全作用域解锁与按槽伪装**
   - 绕过系统/ColorOS `CarrierConfig` 开关隐藏、Entitlement/Provisioning 云端资格校验，强制 `WIFI_PREFERRED` 与 `EPDG_ADDRESS_PLMN`；
   - 按卡槽自适应返回 SIM 归属 ISO 国家码并拦截基站/Wi-Fi PANI/CNI/地理位置上报（同时保留真实 `NITZ` 时区判定不受干扰）。
@@ -63,9 +64,9 @@ flowchart TB
 
 ## 环境要求
 
-- **芯片平台**：搭载高通骁龙基带及 `/dev/diag`、`QRTR` 接口的设备（已实测适配骁龙平台 Android 15 / ColorOS）。
+- **芯片平台**：搭载高通骁龙基带的设备（原生支持 `/dev/diag` 与无 `/dev/diag` GKI 新平台 `diag-router` 双后端自动探测；未开放任意 Diag 通道时自动降级为上层解锁 + `siminfo` 校准模式）。
 - **系统版本**：Android 10（API 29）及以上。
-- **Root 环境**：KernelSU / APatch / Magisk 任一（支持模块挂载与 `/dev/diag` 访问）。
+- **Root 环境**：KernelSU / APatch / Magisk 任一（支持模块挂载与 Root 守护）。
 - **Xposed 环境**：LSPosed / Vector 等支持 `API 82+` 的现代 Xposed 框架。
 
 ---
@@ -75,10 +76,10 @@ flowchart TB
 ### 1. 安装模块与插件
 
 1. 从 Releases 下载（或自行构建）：
-   - `VoWiFiX-v1.0.0.zip`（Root 模块，模块 ID：`vowifix`）
-   - `VoWiFiX-LSPosed-v1.0.0.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
-2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.0.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
-3. 安装 `VoWiFiX-LSPosed-v1.0.0.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
+   - `VoWiFiX-v1.0.1.zip`（Root 模块，模块 ID：`vowifix`）
+   - `VoWiFiX-LSPosed-v1.0.1.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
+2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.1.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
+3. 安装 `VoWiFiX-LSPosed-v1.0.1.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
    - `android` / `system`（系统框架）
    - `com.android.phone`（电话服务）
    - `com.android.settings`（系统设置）
@@ -96,17 +97,17 @@ flowchart TB
 
 ### 3. 快捷磁贴与桌面图标管理
 
-- **控制中心快捷磁贴**：在系统下拉快捷设置编辑页添加 **VoWiFiX** 磁贴。磁贴仅通过只读属性实时显示当前双卡 VoWiFi/VoLTE 注册概览，绝不触发 `/dev/diag` 访问；点击磁贴可直达控制台。
+- **控制中心快捷磁贴**：在系统下拉快捷设置编辑页添加 **VoWiFiX** 磁贴。磁贴仅通过只读属性实时显示当前双卡 VoWiFi/VoLTE 注册概览，绝不触发 Diag 通道访问；点击磁贴可直达控制台。
 - **隐藏桌面图标**：在控制台右上角点击“隐藏图标”可安全隐藏桌面入口；隐藏后仍可通过下拉快捷磁贴或 **LSPosed 管理器 → 模块 → VoWiFiX（设置图标）** 重新打开控制台。
 
 ---
 
 ## 安全机制、备份与还原
 
-为防止并发读写高通 `/dev/diag` 或在异常时机复位基带引起掉网、断话或持久化损坏，VoWiFiX 在 C 工具层、守护脚本与 App 层内置了多重协同安全策略：
+为防止并发读写高通 Diag 通道（`/dev/diag` / `diag-router`）或在异常时机复位基带引起掉网、断话或持久化损坏，VoWiFiX 在 C 工具层、守护脚本与 App 层内置了多重协同安全策略：
 
 1. **原始 EFS 自动备份**：每次对任意槽位或配置文件写入补丁前，若目标尚未修改过，会先将基带原始文件按当前卡首次状态保存至 `/data/adb/vowifix/`（例如 `slot0_orig.bin`、`slot0_se_orig.bin`），历史备份在切卡时自动按时间戳归档，不覆盖已有备份。
-2. **跨进程互斥锁**：C 工具 `flock()` 与 Shell/App 的 `flock -n` 共享同一内核文件锁 `/data/adb/vowifix/diag.lock`，杜绝切卡守护、开机自检与手动操作同时争抢 `/dev/diag`。
+2. **跨进程互斥锁**：C 工具 `flock()` 与 Shell/App 的 `flock -n` 共享同一内核文件锁 `/data/adb/vowifix/diag.lock`，杜绝切卡守护、开机自检与手动操作同时争抢 Diag 通道。
 3. **EFS 同步与严格落盘等待**：每次 EFS 写入后均会回读逐字节比对校验并下发 `EFS2_DIAG_SYNC_NO_WAIT` 轮询至 `EFS_SYNC_COMPLETE=1`；有实质改动时强制等待 **6 秒** 确认持久化落盘后再触发 `QMI` 热刷新。
 4. **通话保护与刷新冷却**：写入/刷新前检测 `mCallState=[12]`，来电或通话中自动延后操作绝不断话；后台与 App 均设 **45 秒** 热刷新冷却与复位后 **20 秒** 稳定观察窗口，避免频繁打断基带。
 5. **一键还原出厂配置**：

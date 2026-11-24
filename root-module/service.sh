@@ -70,7 +70,6 @@ is_call_active() {
 is_sim_settled() {
     bb="$(getprop gsm.version.baseband)"
     sim_st="$(getprop gsm.sim.state)"
-    [ -c /dev/diag ] || return 1
     [ -n "$bb" ] || return 1
     echo "$sim_st" | grep -q "LOADED" || return 1
     echo "$sim_st" | grep -qE "NOT_READY|IMSI|UNKNOWN" && return 1
@@ -128,6 +127,17 @@ apply_patch_and_refresh() {
         wait_call=$((wait_call + 1))
     done
 
+    DETECT_LINE="$("$BIN" detect 2>/dev/null | head -n 1)"
+    DIAG_BACKEND="${DETECT_LINE#BACKEND=}"
+    [ -n "$DIAG_BACKEND" ] || DIAG_BACKEND="none"
+
+    if [ "$DIAG_BACKEND" = "none" ]; then
+        # 无可用 Diag 通道（如 GKI 新平台）时进入仅上层与 siminfo 校准模式，跳过 EFS 写入避免报错刷屏
+        log_msg "INFO: [$reason] no diag backend available (GKI/upper-layer only mode), skipping EFS patch (bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
+        normalize_siminfo_wfc_mode "$reason"
+        return 0
+    fi
+
     did_refresh=0
     (
         tries=0
@@ -140,7 +150,7 @@ apply_patch_and_refresh() {
             sleep 1
         done
 
-        log_msg "INFO: [$reason] running vowifix-efs patch all (bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
+        log_msg "INFO: [$reason] running vowifix-efs patch all (backend=$DIAG_BACKEND, bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
         OUT=$("$BIN" patch all --no-lock --backup-dir "$DATA_DIR" 2>&1)
         RC=$?
         log_msg "RC=$RC | $(echo "$OUT" | tr '\n' '; ')"
@@ -203,7 +213,7 @@ apply_patch_and_refresh() {
     fi
 
     if [ "$did_refresh" -eq 1 ]; then
-        # 规程 B：基带刷新后等待 baseband 与 LOADED 恢复并再安静延迟 20 秒不碰 /dev/diag
+        # 规程 B：基带刷新后等待 baseband 与 LOADED 恢复并再安静延迟 20 秒不碰 Diag 通道
         w=0
         while [ "$w" -lt 30 ]; do
             if is_sim_settled; then
@@ -224,7 +234,7 @@ while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$elapsed" -lt 120 ]; do
     elapsed=$((elapsed + 2))
 done
 
-# 2. 等待 /dev/diag 就绪、基带版本号非空且至少一张 SIM 加载完成（最长 60 秒）
+# 2. 等待基带版本号非空且至少一张 SIM 加载完成（最长 60 秒）
 elapsed=0
 while [ "$elapsed" -lt 60 ]; do
     if is_sim_settled; then
