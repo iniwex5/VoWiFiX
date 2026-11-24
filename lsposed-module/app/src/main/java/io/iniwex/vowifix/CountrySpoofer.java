@@ -240,7 +240,7 @@ public final class CountrySpoofer {
     }
 
     /**
-     * 获取全局默认目标国家码。
+     * 获取全局默认目标国家码（兼容副卡无蜂窝驻网或飞行模式等跨国双卡场景）。
      */
     public static String getGlobalTargetIso() {
         String override = readOverrideIso();
@@ -253,8 +253,10 @@ public final class CountrySpoofer {
         }
         String[] isoParts = rawIso.split(",", -1);
         String firstFallbackIso = null;
-        boolean hasAnyNetworkMcc = false;
+        String nonCnFallbackIso = null;
+        String knownDeviceNetMcc = null;
 
+        // 第 1 遍：记录兜底归属国与设备已确认驻网 MCC，同时优先识别自包含跨国漫游的卡槽
         for (int i = 0; i < isoParts.length; i++) {
             String iso = getTargetIsoForSlot(i);
             if (iso == null) {
@@ -263,16 +265,41 @@ public final class CountrySpoofer {
             if (firstFallbackIso == null) {
                 firstFallbackIso = iso;
             }
+            if (nonCnFallbackIso == null && !"cn".equals(iso)) {
+                nonCnFallbackIso = iso;
+            }
             String simMcc = extractMcc(getSlotPropPart("gsm.sim.operator.numeric", i));
             String netMcc = extractMcc(getSlotPropPart("gsm.operator.numeric", i));
             if (netMcc != null) {
-                hasAnyNetworkMcc = true;
+                if (knownDeviceNetMcc == null) {
+                    knownDeviceNetMcc = netMcc;
+                }
                 if (simMcc != null && !simMcc.equals(netMcc)) {
                     return iso;
                 }
             }
         }
-        return hasAnyNetworkMcc ? null : firstFallbackIso;
+
+        // 第 2 遍：另一张卡已证实设备位于异国时，识别无蜂窝服务的海外跨国副卡；纯本土双卡返回 null
+        if (knownDeviceNetMcc != null) {
+            for (int i = 0; i < isoParts.length; i++) {
+                String iso = getTargetIsoForSlot(i);
+                if (iso == null) {
+                    continue;
+                }
+                String netMcc = extractMcc(getSlotPropPart("gsm.operator.numeric", i));
+                if (netMcc == null) {
+                    String simMcc = extractMcc(getSlotPropPart("gsm.sim.operator.numeric", i));
+                    if (simMcc != null && !simMcc.equals(knownDeviceNetMcc)) {
+                        return iso;
+                    }
+                }
+            }
+            return null;
+        }
+
+        // 全双卡无蜂窝驻网或处于飞行模式时，优先返回首个非本土 CN 归属国
+        return nonCnFallbackIso != null ? nonCnFallbackIso : firstFallbackIso;
     }
 
     /**

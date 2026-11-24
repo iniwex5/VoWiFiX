@@ -139,6 +139,7 @@ apply_patch_and_refresh() {
     fi
 
     did_refresh=0
+    REFRESH_TARGET="all"
     (
         tries=0
         while ! /system/bin/flock -n 8 2>/dev/null; do
@@ -160,8 +161,21 @@ apply_patch_and_refresh() {
         [ "$RC" -ne 0 ] && exit 1
 
         if echo "$OUT" | grep -qE "CHANGED=[1-9]"; then
+            # 仅按实际被写入变更的卡槽选择性触发 QMI 热刷新，热插副卡时不打断主卡在线状态
+            CHG_S0=0
+            CHG_S1=0
+            printf '%s\n' "$OUT" | grep -qE "(/efsprofiles/overideconfig|/nv/item_files/ims/qp_ims_service_enablement_config) ->" && CHG_S0=1
+            printf '%s\n' "$OUT" | grep -q "_Subscription01 ->" && CHG_S1=1
+            if [ "$CHG_S0" -eq 1 ] && [ "$CHG_S1" -eq 0 ]; then
+                REFRESH_TARGET="slot0"
+            elif [ "$CHG_S0" -eq 0 ] && [ "$CHG_S1" -eq 1 ]; then
+                REFRESH_TARGET="slot1"
+            else
+                REFRESH_TARGET="all"
+            fi
+
             # 规程 A：EFS_SYNC_COMPLETE=1 后至少静候 5 秒以上才能触发任何基带复位或刷新动作
-            log_msg "INFO: [$reason] EFS updated, waiting 6s for persistent flush before QMI refresh..."
+            log_msg "INFO: [$reason] EFS updated (target=$REFRESH_TARGET), waiting 6s for persistent flush before QMI refresh..."
             sleep 6
 
             now_ts="$(date +%s)"
@@ -172,19 +186,29 @@ apply_patch_and_refresh() {
             fi
 
             if is_call_active; then
-                log_msg "INFO: [$reason] call became active during flush window, deferring refresh"
-                exit 2
+                log_msg "INFO: [$reason] call became active during flush window, deferring refresh (target=$REFRESH_TARGET)"
+                case "$REFRESH_TARGET" in
+                    slot0) exit 20 ;;
+                    slot1) exit 21 ;;
+                    *) exit 22 ;;
+                esac
             fi
 
-            ROUT=$("$BIN" refresh --no-lock 2>&1)
+            ROUT=$("$BIN" refresh "$REFRESH_TARGET" --no-lock 2>&1)
             RRC=$?
-            log_msg "INFO: [$reason] refresh RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
+            log_msg "INFO: [$reason] refresh target=$REFRESH_TARGET RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
             [ "$RRC" -eq 0 ] && exit 10
             exit 1
         fi
         exit 0
     ) 8>"$LOCK_FILE"
     TX_RC=$?
+
+    case "$TX_RC" in
+        20) REFRESH_TARGET="slot0"; TX_RC=2 ;;
+        21) REFRESH_TARGET="slot1"; TX_RC=2 ;;
+        22) REFRESH_TARGET="all"; TX_RC=2 ;;
+    esac
 
     if [ "$TX_RC" -eq 2 ]; then
         while is_call_active; do
@@ -198,9 +222,9 @@ apply_patch_and_refresh() {
                 [ "$tries" -ge 30 ] && exit 1
                 sleep 1
             done
-            ROUT=$("$BIN" refresh --no-lock 2>&1)
+            ROUT=$("$BIN" refresh "$REFRESH_TARGET" --no-lock 2>&1)
             RRC=$?
-            log_msg "INFO: [$reason] deferred refresh RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
+            log_msg "INFO: [$reason] deferred refresh target=$REFRESH_TARGET RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
             [ "$RRC" -eq 0 ] && exit 10
             exit 1
         ) 8>"$LOCK_FILE"

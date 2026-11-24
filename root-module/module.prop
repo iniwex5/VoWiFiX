@@ -1,6 +1,6 @@
 id=vowifix
 name=VoWiFiX
-version=v1.0.1
-versionCode=101
+version=v1.0.2
+versionCode=102
 author=iniwex
 description=VoWiFiX 原生 VoWiFi 全栈增强模块（KSU/APatch/Magisk）：IMS 能力解锁、双后端 Diag（/dev/diag + GKI diag-router）跨运营商双卡 EFS 合并与切卡免重启 QMI MCFG 热刷新。

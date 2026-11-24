@@ -12,7 +12,7 @@ VoWiFiX 将 **Root 基带 EFS 层工具**（`vowifix-efs` + 切卡自动守护�
   - 原生支持高通传统 `/dev/diag` (`diagchar`) 与 GKI 新平台 `diag-router`（`AF_UNIX` `SOCK_SEQPACKET`）双后端自动探测（`EFS2_DIAG_*`），对 `/efsprofiles/overideconfig`（及双卡副槽 `_Subscription01`）执行只增不毁、逐字节校验的 `6` 键通用配置合并，保留各卡原有 APN/端口/加密策略不变；
   - 同步对活跃槽位 `/nv/item_files/ims/qp_ims_service_enablement_config` 执行最小 `3` 字节解锁（启用 Wi-Fi 通话总开关、将移动网络优先改回 Wi-Fi 优先、解除漫游强制禁用 VoWiFi），破除部分海外或漫游 SIM 卡的基带硬锁。
 - **跨卡热切换免重启自适应**
-  - 常驻守护进程监听双卡 `gsm.sim.state` 与 `MCC/MNC` 变动，在切卡或漫游就绪后自动完成 EFS 合并、`telephony/siminfo` 历史策略校准，并通过 Qualcomm `QRTR` (`AF_QIPCRTR`) 原生下发 `QMI_VS` (`0x008e`) 热刷新基带配置，无需重启即可生效；
+  - 常驻守护进程监听双卡 `gsm.sim.state` 与 `MCC/MNC` 变动，在切卡或漫游就绪后自动完成 EFS 合并、`telephony/siminfo` 历史策略校准，并通过 Qualcomm `QRTR` (`AF_QIPCRTR`) 按变更卡槽下发 `QMI_VS` 订阅绑定（`0x0021`）+ `0x008e` 独立/双槽热刷新（热插副卡时不打断主卡在线状态），无需重启即可生效；
   - 自 `v1.0.1` 起引入多后端 Diag 传输层抽象与无副作用探测（`vowifix-efs detect`）：单文件静态二进制即可自动适配旧平台 `/dev/diag` 与骁龙 8 Gen 2 / 8 Gen 3 / 8 Elite 等 GKI 新平台的 `diag-router`；对极少数完全封禁 Diag 的商用 ROM 也会优雅切换至“上层解锁 + `siminfo` 校准 + QRTR 刷新”模式，消除开机等待超时与报错刷屏。
 - **LSPosed 全作用域解锁与按槽伪装**
   - 绕过系统/ColorOS `CarrierConfig` 开关隐藏、Entitlement/Provisioning 云端资格校验，强制 `WIFI_PREFERRED` 与 `EPDG_ADDRESS_PLMN`；
@@ -76,10 +76,10 @@ flowchart TB
 ### 1. 安装模块与插件
 
 1. 从 Releases 下载（或自行构建）：
-   - `VoWiFiX-v1.0.1.zip`（Root 模块，模块 ID：`vowifix`）
-   - `VoWiFiX-LSPosed-v1.0.1.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
-2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.1.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
-3. 安装 `VoWiFiX-LSPosed-v1.0.1.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
+   - `VoWiFiX-v1.0.2.zip`（Root 模块，模块 ID：`vowifix`）
+   - `VoWiFiX-LSPosed-v1.0.2.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
+2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.2.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
+3. 安装 `VoWiFiX-LSPosed-v1.0.2.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
    - `android` / `system`（系统框架）
    - `com.android.phone`（电话服务）
    - `com.android.settings`（系统设置）

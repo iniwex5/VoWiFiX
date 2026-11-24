@@ -62,11 +62,20 @@
 #define QRTR_TYPE_NEW_SERVER 4
 #define QRTR_TYPE_NEW_LOOKUP 10
 #define QMI_VS_SERVICE_ID 0x00e5U
+#define QMI_VS_MSG_BIND_SUBS 0x0021U
 #define QMI_VS_MSG_REFRESH_EFS 0x008eU
+#define QMI_SUBS_PRIMARY 0U
+#define QMI_SUBS_SECONDARY 1U
 #define QMI_HDR_FLAG_REQ 0x00U
 #define QMI_HDR_FLAG_RESP 0x02U
 #define MCFG_TYPE_SW 1U
 #define MCFG_ACTIVATION_REFRESH_ONLY 1U
+
+typedef enum {
+    REFRESH_SLOT_ALL = -1,
+    REFRESH_SLOT_0 = 0,
+    REFRESH_SLOT_1 = 1
+} refresh_slot_opt_t;
 
 struct __attribute__((packed)) diag_logging_mode_param_t {
     uint32_t req_mode;
@@ -1595,6 +1604,27 @@ struct __attribute__((packed)) qmi_msg_hdr {
     uint16_t msg_len;
 };
 
+/* 构造 QMI_VS_BIND_SUBSCRIPTION_REQ_MSG_V01 (0x0021) 请求报文，指定后续刷新目标卡槽订阅 */
+static int qmi_build_bind_subs_req(uint16_t txn_id, uint32_t subs_id, uint8_t *out, size_t cap) {
+    if (!out || cap < sizeof(struct qmi_msg_hdr) + 7) return -1;
+    struct qmi_msg_hdr *hdr = (struct qmi_msg_hdr *)out;
+    hdr->flags = QMI_HDR_FLAG_REQ;
+    hdr->txn_id = txn_id;
+    hdr->msg_id = QMI_VS_MSG_BIND_SUBS;
+    hdr->msg_len = 7;
+
+    uint8_t *p = out + sizeof(struct qmi_msg_hdr);
+    /* TLV 0x01: subs_id (4B LE: 0=PRIMARY, 1=SECONDARY, 2=TERTIARY) */
+    p[0] = 0x01;
+    p[1] = 0x04;
+    p[2] = 0x00;
+    p[3] = (uint8_t)(subs_id & 0xFF);
+    p[4] = (uint8_t)((subs_id >> 8) & 0xFF);
+    p[5] = (uint8_t)((subs_id >> 16) & 0xFF);
+    p[6] = (uint8_t)((subs_id >> 24) & 0xFF);
+    return (int)(sizeof(struct qmi_msg_hdr) + 7);
+}
+
 /* 构造 QMI_VS_REFRESH_MODEM_EFS_REQ_MSG_V01 (0x008e) 请求报文 */
 static int qmi_build_refresh_efs_req(uint16_t txn_id, uint32_t config_type, uint32_t activation_type,
                                      uint8_t *out, size_t cap) {
@@ -1707,8 +1737,42 @@ static int qrtr_lookup_service(int fd, uint32_t service, uint32_t *out_node, uin
     return found ? 0 : -1;
 }
 
-/* 通过纯内核 QRTR 发送高通 MCFG/EFS 热刷新指令（不触发整机重启或 Diag 访问） */
-static int qmi_trigger_modem_efs_refresh(uint32_t config_type, uint32_t activation_type) {
+/* 发送 QMI 请求并阻塞等待目标事务响应，自动跳过路过事件包；返回 0=成功，1=QMI拒绝，-1=通信或解析失败 */
+static int qmi_send_and_wait_void(int fd, const struct sockaddr_qrtr_uapi *dst,
+                                   const uint8_t *req, size_t req_len,
+                                   uint16_t txn_id, uint16_t expected_msg,
+                                   uint32_t *out_res, uint32_t *out_err) {
+    if (sendto(fd, req, req_len, 0, (const struct sockaddr *)dst, sizeof(*dst)) < 0) {
+        fprintf(stderr, "QMI msg 0x%04x sendto failed: %s\n", expected_msg, strerror(errno));
+        return -1;
+    }
+
+    uint8_t rsp[512];
+    for (int tries = 0; tries < 8; tries++) {
+        ssize_t n = recv(fd, rsp, sizeof(rsp), 0);
+        if (n < 0) {
+            fprintf(stderr, "QMI msg 0x%04x recv timeout/error: %s\n", expected_msg, strerror(errno));
+            return -1;
+        }
+        uint32_t qres = 0xFFFFFFFFU, qerr = 0xFFFFFFFFU;
+        int pr = qmi_parse_void_resp(rsp, (size_t)n, txn_id, expected_msg, &qres, &qerr);
+        if (pr == -2) continue; /* 忽略路过事件包或非目标响应 */
+        if (out_res) *out_res = qres;
+        if (out_err) *out_err = qerr;
+        if (pr != 0) {
+            fprintf(stderr, "QMI msg 0x%04x response invalid: parse=%d\n", expected_msg, pr);
+            return -1;
+        }
+        return (qres == 0 && qerr == 0) ? 0 : 1;
+    }
+
+    fprintf(stderr, "QMI msg 0x%04x failed: no matching response\n", expected_msg);
+    return -1;
+}
+
+/* 对单一卡槽订阅创建独立 QRTR 客户端并执行订阅绑定 + MCFG/EFS 热刷新；返回 0=成功，-2=非主卡绑定被拒跳过，-1=失败 */
+static int qmi_trigger_single_sub_refresh(uint32_t subs_id, uint32_t config_type,
+                                          uint32_t activation_type, int strict_bind) {
     int fd = socket(AF_QIPCRTR, SOCK_DGRAM, 0);
     if (fd < 0) {
         fprintf(stderr, "socket(AF_QIPCRTR) failed: %s\n", strerror(errno));
@@ -1727,49 +1791,109 @@ static int qmi_trigger_modem_efs_refresh(uint32_t config_type, uint32_t activati
         return -1;
     }
 
-    uint8_t req[64];
-    const uint16_t txn_id = 1;
-    int req_len = qmi_build_refresh_efs_req(txn_id, config_type, activation_type, req, sizeof(req));
-    if (req_len < 0) {
-        close(fd);
-        return -1;
-    }
-
     struct sockaddr_qrtr_uapi dst;
     memset(&dst, 0, sizeof(dst));
     dst.sq_family = AF_QIPCRTR;
     dst.sq_node = node;
     dst.sq_port = port;
-    if (sendto(fd, req, (size_t)req_len, 0, (const struct sockaddr *)&dst, sizeof(dst)) < 0) {
-        fprintf(stderr, "QMI refresh sendto failed: %s\n", strerror(errno));
+
+    /* 必须先为当前连接绑定目标卡槽订阅，否则 QMI_VS 默认只刷新主卡 (subs_id=0) */
+    uint8_t bind_req[32];
+    int bind_len = qmi_build_bind_subs_req(1, subs_id, bind_req, sizeof(bind_req));
+    if (bind_len < 0) {
         close(fd);
         return -1;
     }
+    uint32_t bres = 0xFFFFFFFFU, berr = 0xFFFFFFFFU;
+    int brc = qmi_send_and_wait_void(fd, &dst, bind_req, (size_t)bind_len,
+                                     1, QMI_VS_MSG_BIND_SUBS, &bres, &berr);
+    if (brc != 0) {
+        if (subs_id == QMI_SUBS_PRIMARY) {
+            /* 新建客户端默认已绑定主卡 0，若旧固件未开放 0x0021 告警后继续尝试刷新 */
+            fprintf(stderr, "WARN: QMI_VS bind_subscription(sub=%u) returned rc=%d qmi_res=%u qmi_err=%u; continuing with default primary binding\n",
+                    subs_id, brc, bres, berr);
+        } else if (strict_bind) {
+            fprintf(stderr, "QMI bind_subscription(sub=%u) rejected: rc=%d qmi_res=%u qmi_err=%u\n",
+                    subs_id, brc, bres, berr);
+            close(fd);
+            return -1;
+        } else {
+            printf("EFS_REFRESH_SKIP sub=%u reason=bind_unsupported (rc=%d qmi_res=%u qmi_err=%u)\n",
+                   subs_id, brc, bres, berr);
+            close(fd);
+            return -2;
+        }
+    }
 
-    uint8_t rsp[512];
-    for (int tries = 0; tries < 8; tries++) {
-        ssize_t n = recv(fd, rsp, sizeof(rsp), 0);
-        if (n < 0) {
-            fprintf(stderr, "QMI refresh recv timeout/error: %s\n", strerror(errno));
+    uint8_t ref_req[64];
+    int max_attempts = (!strict_bind && subs_id == QMI_SUBS_SECONDARY) ? 2 : 1;
+    uint32_t qres = 0xFFFFFFFFU, qerr = 0xFFFFFFFFU;
+    int rrc = -1;
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        uint16_t txn = (uint16_t)(2 + attempt);
+        int ref_len = qmi_build_refresh_efs_req(txn, config_type, activation_type, ref_req, sizeof(ref_req));
+        if (ref_len < 0) {
             close(fd);
             return -1;
         }
-        uint32_t qres = 0xFFFFFFFFU, qerr = 0xFFFFFFFFU;
-        int pr = qmi_parse_void_resp(rsp, (size_t)n, txn_id, QMI_VS_MSG_REFRESH_EFS, &qres, &qerr);
-        if (pr == -2) continue; /* 忽略路过事件包或非目标响应 */
-        close(fd);
-        if (pr != 0 || qres != 0 || qerr != 0) {
-            fprintf(stderr, "QMI refresh rejected: parse=%d qmi_res=%u qmi_err=%u\n", pr, qres, qerr);
-            return -1;
+        qres = 0xFFFFFFFFU;
+        qerr = 0xFFFFFFFFU;
+        rrc = qmi_send_and_wait_void(fd, &dst, ref_req, (size_t)ref_len,
+                                     txn, QMI_VS_MSG_REFRESH_EFS, &qres, &qerr);
+        if (rrc == 0) {
+            close(fd);
+            printf("EFS_REFRESH_OK=1 sub=%u node=%u port=%u cfg=%u act=%u\n",
+                   subs_id, node, port, config_type, activation_type);
+            return 0;
         }
-        printf("EFS_REFRESH_OK=1 node=%u port=%u cfg=%u act=%u\n",
-               node, port, config_type, activation_type);
-        return 0;
+        /* all 模式下紧随主卡刷副卡若遭遇 MCFG 瞬时忙，静候 1 秒后重试一次 */
+        if (attempt + 1 < max_attempts) {
+            fprintf(stderr, "WARN: QMI refresh sub=%u busy/failed (rc=%d qmi_res=%u qmi_err=%u), retrying after 1s...\n",
+                    subs_id, rrc, qres, qerr);
+            sleep(1);
+        }
     }
 
-    fprintf(stderr, "QMI refresh failed: no matching response\n");
+    fprintf(stderr, "QMI refresh(sub=%u) rejected: rc=%d qmi_res=%u qmi_err=%u\n",
+            subs_id, rrc, qres, qerr);
     close(fd);
     return -1;
+}
+
+/* 解析 refresh 子命令的可选卡槽参数 */
+static int parse_refresh_slot(const char *arg, refresh_slot_opt_t *out) {
+    if (!arg || !out) return -1;
+    if (strcmp(arg, "all") == 0) {
+        *out = REFRESH_SLOT_ALL;
+        return 0;
+    }
+    if (strcmp(arg, "slot0") == 0) {
+        *out = REFRESH_SLOT_0;
+        return 0;
+    }
+    if (strcmp(arg, "slot1") == 0) {
+        *out = REFRESH_SLOT_1;
+        return 0;
+    }
+    return -1;
+}
+
+/* 通过纯内核 QRTR 按目标卡槽（slot0/slot1/all）依次绑定订阅并发送高通 MCFG/EFS 热刷新指令 */
+static int qmi_trigger_modem_efs_refresh(refresh_slot_opt_t slot_opt, uint32_t config_type, uint32_t activation_type) {
+    if (slot_opt == REFRESH_SLOT_0) {
+        return qmi_trigger_single_sub_refresh(QMI_SUBS_PRIMARY, config_type, activation_type, 1);
+    }
+    if (slot_opt == REFRESH_SLOT_1) {
+        return qmi_trigger_single_sub_refresh(QMI_SUBS_SECONDARY, config_type, activation_type, 1);
+    }
+
+    int rc0 = qmi_trigger_single_sub_refresh(QMI_SUBS_PRIMARY, config_type, activation_type, 0);
+    if (rc0 == 0) {
+        /* 双卡依次刷新间预留 500ms 间隔，避免基带 MCFG 队列瞬时拥塞 */
+        usleep(500 * 1000);
+    }
+    int rc1 = qmi_trigger_single_sub_refresh(QMI_SUBS_SECONDARY, config_type, activation_type, 0);
+    return (rc0 == 0 || rc1 == 0) ? 0 : -1;
 }
 
 static int run_self_tests(void) {
@@ -1846,7 +1970,24 @@ static int run_self_tests(void) {
 
     free(out1); free(out2); free(out3); free(out4); free(out5); free(out5_ils);
 
-    /* 用例 6：QMI VS 热刷新请求编码与响应解析校验 */
+    /* 用例 6：QMI VS 订阅绑定与热刷新请求编码与响应解析校验 */
+    uint8_t breq0[32], breq1[32];
+    int blen0 = qmi_build_bind_subs_req(3, QMI_SUBS_PRIMARY, breq0, sizeof(breq0));
+    int blen1 = qmi_build_bind_subs_req(4, QMI_SUBS_SECONDARY, breq1, sizeof(breq1));
+    const uint8_t expected_breq0[14] = {
+        0x00, 0x03, 0x00, 0x21, 0x00, 0x07, 0x00,
+        0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    const uint8_t expected_breq1[14] = {
+        0x00, 0x04, 0x00, 0x21, 0x00, 0x07, 0x00,
+        0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00
+    };
+    if (blen0 != 14 || memcmp(breq0, expected_breq0, 14) != 0 ||
+        blen1 != 14 || memcmp(breq1, expected_breq1, 14) != 0) {
+        fprintf(stderr, "FAIL T6 qmi bind_subs request encode mismatch\n");
+        return 1;
+    }
+
     uint8_t qreq[32];
     int qlen = qmi_build_refresh_efs_req(7, MCFG_TYPE_SW, MCFG_ACTIVATION_REFRESH_ONLY, qreq, sizeof(qreq));
     const uint8_t expected_qreq[21] = {
@@ -2144,7 +2285,7 @@ int main(int argc, char **argv) {
                 "Usage: %s [--ils-only] [--no-lock] [--remote|--local] "
                 "[--backend=auto|diagchar|diag-router|libdiag|none] [--backup-dir <dir>] "
                 "detect|probe|status [slot0|slot1|all]|patch [slot0|slot1|all]|restore [slot0|slot1|all]|"
-                "refresh [cfg act]|stat <efs_path>|read <efs_path> <local_out>|--self-test\n",
+                "refresh [slot0|slot1|all] [cfg act]|stat <efs_path>|read <efs_path> <local_out>|--self-test\n",
                 argv[0]);
         return 2;
     }
@@ -2167,18 +2308,32 @@ int main(int argc, char **argv) {
 
     /* refresh 走纯内核 QRTR 通路，严禁打开 Diag 通道，避免与刚落盘或重启的基带产生并发冲突 */
     if (strcmp(cmd, "refresh") == 0) {
+        refresh_slot_opt_t slot_opt = REFRESH_SLOT_ALL;
         uint32_t cfg = MCFG_TYPE_SW;
         uint32_t act = MCFG_ACTIVATION_REFRESH_ONLY;
-        int rrc = 0;
-        if (pos_argc >= 3) {
-            cfg = (uint32_t)strtoul(pos_args[1], NULL, 0);
-            act = (uint32_t)strtoul(pos_args[2], NULL, 0);
-        } else if (pos_argc == 2) {
-            fprintf(stderr, "refresh requires either 0 args (default 1 1) or 2 args (<cfg> <act>)\n");
+        int arg_i = 1;
+        if (arg_i < pos_argc && parse_refresh_slot(pos_args[arg_i], &slot_opt) == 0) {
+            arg_i++;
+        }
+        int rem = pos_argc - arg_i;
+        if (rem == 2) {
+            char *e1 = NULL, *e2 = NULL;
+            unsigned long v1 = strtoul(pos_args[arg_i], &e1, 0);
+            unsigned long v2 = strtoul(pos_args[arg_i + 1], &e2, 0);
+            if (!e1 || e1 == pos_args[arg_i] || *e1 != '\0' ||
+                !e2 || e2 == pos_args[arg_i + 1] || *e2 != '\0') {
+                fprintf(stderr, "refresh requires valid numeric <cfg> <act>\n");
+                if (lock_fd >= 0) close(lock_fd);
+                return 2;
+            }
+            cfg = (uint32_t)v1;
+            act = (uint32_t)v2;
+        } else if (rem != 0) {
+            fprintf(stderr, "Usage: %s refresh [slot0|slot1|all] [cfg act]\n", argv[0]);
             if (lock_fd >= 0) close(lock_fd);
             return 2;
         }
-        rrc = (qmi_trigger_modem_efs_refresh(cfg, act) == 0) ? 0 : 1;
+        int rrc = (qmi_trigger_modem_efs_refresh(slot_opt, cfg, act) == 0) ? 0 : 1;
         if (lock_fd >= 0) close(lock_fd);
         return rrc;
     }
