@@ -235,7 +235,7 @@ public class MainActivity extends Activity {
         tvApp.setTypeface(Typeface.DEFAULT_BOLD);
         titleGroup.addView(tvApp);
 
-        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.4", palette.accent, palette.accentBg);
+        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.5", palette.accent, palette.accentBg);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         verLp.leftMargin = UiHelper.dp(this, 8);
@@ -700,8 +700,20 @@ public class MainActivity extends Activity {
                 String hostNet = slot.netAlpha.isEmpty() ? slot.netNumeric : slot.netAlpha + " (" + slot.netNumeric + ")";
                 sv.tvRoamingLine.setText("漫游状态: 国际漫游中 · 驻留 " + hostNet);
                 sv.tvRoamingLine.setTextColor(palette.warning);
-            } else {
+            } else if (slot.isHomeCellular()) {
                 sv.tvRoamingLine.setText("漫游状态: 本地网络");
+                sv.tvRoamingLine.setTextColor(palette.textSecondary);
+            } else if (!slot.hasCellularNetwork()) {
+                if (slot.isIwlanOnly()) {
+                    sv.tvRoamingLine.setText("漫游状态: 未驻留蜂窝网络（仅 Wi-Fi）");
+                    sv.tvRoamingLine.setTextColor(palette.textSecondary);
+                } else {
+                    sv.tvRoamingLine.setText("漫游状态: 未驻留蜂窝网络（无服务）");
+                    sv.tvRoamingLine.setTextColor(palette.textMuted);
+                }
+            } else {
+                String hostNet = slot.netAlpha.isEmpty() ? slot.netNumeric : slot.netAlpha + " (" + slot.netNumeric + ")";
+                sv.tvRoamingLine.setText("漫游状态: 驻留 " + hostNet);
                 sv.tvRoamingLine.setTextColor(palette.textSecondary);
             }
         }

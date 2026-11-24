@@ -52,6 +52,8 @@
 #define EFS_PATH_SLOT1 "/efsprofiles/overideconfig_Subscription01"
 #define EFS_SE_PATH_SLOT0 "/nv/item_files/ims/qp_ims_service_enablement_config"
 #define EFS_SE_PATH_SLOT1 "/nv/item_files/ims/qp_ims_service_enablement_config_Subscription01"
+#define EFS_S2B_PATH_SLOT0 "/data/iwlan_s2b_config.xml"
+#define EFS_S2B_PATH_SLOT1 "/data/iwlan_s2b_config.xml_Subscription01"
 #define DEFAULT_BACKUP_DIR "/data/adb/vowifix"
 #define DEFAULT_LOCK_PATH "/data/adb/vowifix/diag.lock"
 
@@ -120,6 +122,8 @@ typedef struct {
     const char *efs_path;
     const char *se_path;
     const char *se_backup_prefix;
+    const char *s2b_path;
+    const char *s2b_backup_prefix;
 } slot_target_t;
 
 typedef struct {
@@ -146,8 +150,8 @@ static const ini_patch_entry_t UNIVERSAL_PATCHES[] = {
 };
 
 static const slot_target_t ALL_SLOTS[] = {
-    { "slot0", EFS_PATH_SLOT0, EFS_SE_PATH_SLOT0, "slot0_se" },
-    { "slot1", EFS_PATH_SLOT1, EFS_SE_PATH_SLOT1, "slot1_se" },
+    { "slot0", EFS_PATH_SLOT0, EFS_SE_PATH_SLOT0, "slot0_se", EFS_S2B_PATH_SLOT0, "slot0_s2b" },
+    { "slot1", EFS_PATH_SLOT1, EFS_SE_PATH_SLOT1, "slot1_se", EFS_S2B_PATH_SLOT1, "slot1_s2b" },
 };
 
 typedef struct diag_ctx {
@@ -866,7 +870,9 @@ static int is_allowed_write_path(const char *efs_path) {
     return strcmp(efs_path, EFS_PATH_SLOT0) == 0 ||
            strcmp(efs_path, EFS_PATH_SLOT1) == 0 ||
            strcmp(efs_path, EFS_SE_PATH_SLOT0) == 0 ||
-           strcmp(efs_path, EFS_SE_PATH_SLOT1) == 0;
+           strcmp(efs_path, EFS_SE_PATH_SLOT1) == 0 ||
+           strcmp(efs_path, EFS_S2B_PATH_SLOT0) == 0 ||
+           strcmp(efs_path, EFS_S2B_PATH_SLOT1) == 0;
 }
 
 /* 查询 EFS 文件属性；成功返回 0，不存在返回 -2 (diag_errno=ENOENT)，其他错误返回 -1 */
@@ -1534,6 +1540,202 @@ static int se_apply_patch(uint8_t *buf, size_t len) {
         mods++;
     }
     return mods;
+}
+
+/* ===================== iwlan_s2b_config.xml 静态 ePDG FQDN 定点解锁 ===================== */
+
+typedef enum {
+    S2B_STATE_NO_STATIC_FQDN = 0,
+    S2B_STATE_ALREADY_ENABLED = 1,
+    S2B_STATE_NEEDS_PATCH = 2
+} s2b_fqdn_state_t;
+
+static const uint8_t *mem_find_sub(const uint8_t *hay, size_t hay_len, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (!hay || nlen == 0 || hay_len < nlen) return NULL;
+    for (size_t i = 0; i <= hay_len - nlen; i++) {
+        if (hay[i] == (uint8_t)needle[0] && memcmp(hay + i, needle, nlen) == 0) {
+            return hay + i;
+        }
+    }
+    return NULL;
+}
+
+/* 在 XML 缓冲区中匹配非注释区（跳过所有 <!-- ... --> 块）内的子串 */
+static const uint8_t *mem_find_sub_skip_xml_comments(const uint8_t *hay, size_t hay_len, const char *needle) {
+    size_t nlen = needle ? strlen(needle) : 0;
+    if (!hay || nlen == 0 || hay_len < nlen) return NULL;
+    size_t i = 0;
+    while (i < hay_len) {
+        if (i + 4 <= hay_len && memcmp(hay + i, "<!--", 4) == 0) {
+            const uint8_t *end_cmt = mem_find_sub(hay + i + 4, hay_len - (i + 4), "-->");
+            if (!end_cmt) return NULL;
+            i = (size_t)(end_cmt - hay) + 3;
+            continue;
+        }
+        if (i + nlen <= hay_len && hay[i] == (uint8_t)needle[0] && memcmp(hay + i, needle, nlen) == 0) {
+            return hay + i;
+        }
+        i++;
+    }
+    return NULL;
+}
+
+static void trim_ascii_span(const uint8_t *buf, size_t len, size_t *out_off, size_t *out_len) {
+    size_t s = 0, e = len;
+    while (s < e && isspace((unsigned char)buf[s])) s++;
+    while (e > s && isspace((unsigned char)buf[e - 1])) e--;
+    *out_off = s;
+    *out_len = e - s;
+}
+
+static int ascii_eq_nocase(const uint8_t *buf, size_t len, const char *lit) {
+    size_t llen = strlen(lit);
+    if (!buf || len != llen) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (tolower((unsigned char)buf[i]) != tolower((unsigned char)lit[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* 在 XML 区间内查找首对非注释且匹配的 <tag_name ...>...</tag_name>（忽略自闭合标签与近似前缀标签）；
+ * 找到返回 1，同时可选通过 elem_end_out 返回闭合标签结束偏移以便连续扫描同级块。 */
+static int xml_find_element_from(const uint8_t *scope, size_t scope_len, size_t start_off,
+                                 const char *tag_name, const uint8_t **val_start, size_t *val_len,
+                                 size_t *elem_end_out) {
+    char open_prefix[96];
+    char close_tag[96];
+    int op_n = snprintf(open_prefix, sizeof(open_prefix), "<%s", tag_name);
+    int cl_n = snprintf(close_tag, sizeof(close_tag), "</%s>", tag_name);
+    if (op_n <= 1 || cl_n <= 3 || !scope || start_off >= scope_len) return 0;
+
+    size_t pos = start_off;
+    while (pos < scope_len) {
+        const uint8_t *p = mem_find_sub_skip_xml_comments(scope + pos, scope_len - pos, open_prefix);
+        if (!p) return 0;
+        size_t off = (size_t)(p - scope);
+        size_t after = off + (size_t)op_n;
+        if (after >= scope_len) return 0;
+
+        uint8_t next_ch = scope[after];
+        if (next_ch != '>' && next_ch != '/' && !isspace((unsigned char)next_ch)) {
+            pos = after;
+            continue;
+        }
+
+        const uint8_t *gt = (const uint8_t *)memchr(scope + after, '>', scope_len - after);
+        if (!gt) return 0;
+        size_t gt_off = (size_t)(gt - scope);
+        if (gt_off > after && scope[gt_off - 1] == '/') {
+            /* 自闭合标签如 <fqdn/> 不含文本值，跳过 */
+            pos = gt_off + 1;
+            continue;
+        }
+        if (next_ch == '/') {
+            pos = gt_off + 1;
+            continue;
+        }
+
+        size_t body_start = gt_off + 1;
+        const uint8_t *close_p = mem_find_sub_skip_xml_comments(scope + body_start, scope_len - body_start, close_tag);
+        if (!close_p) return 0;
+        size_t body_end = (size_t)(close_p - scope);
+
+        if (val_start) *val_start = scope + body_start;
+        if (val_len) *val_len = body_end - body_start;
+        if (elem_end_out) *elem_end_out = body_end + (size_t)cl_n;
+        return 1;
+    }
+    return 0;
+}
+
+static s2b_fqdn_state_t s2b_inspect_static_fqdn_loc(const uint8_t *buf, size_t len,
+                                                     char *fqdn_out, size_t fqdn_cap,
+                                                     size_t *flag_off_out, size_t *flag_len_out) {
+    if (fqdn_out && fqdn_cap > 0) fqdn_out[0] = '\0';
+    if (!buf || len == 0) return S2B_STATE_NO_STATIC_FQDN;
+
+    size_t scan_off = 0;
+    const uint8_t *blk = NULL;
+    size_t blk_len = 0;
+    size_t next_off = 0;
+    int saw_already_enabled = 0;
+
+    while (xml_find_element_from(buf, len, scan_off, "epdg_addr_info", &blk, &blk_len, &next_off)) {
+        scan_off = next_off;
+
+        const uint8_t *fqdn_p = NULL;
+        size_t fqdn_n = 0;
+        if (!xml_find_element_from(blk, blk_len, 0, "fqdn", &fqdn_p, &fqdn_n, NULL)) {
+            continue;
+        }
+        size_t f_off = 0, f_tlen = 0;
+        trim_ascii_span(fqdn_p, fqdn_n, &f_off, &f_tlen);
+        if (f_tlen == 0) {
+            continue;
+        }
+
+        const uint8_t *en_p = NULL;
+        size_t en_n = 0;
+        if (!xml_find_element_from(blk, blk_len, 0, "static_fqdn_enabled", &en_p, &en_n, NULL)) {
+            continue;
+        }
+        size_t e_off = 0, e_tlen = 0;
+        trim_ascii_span(en_p, en_n, &e_off, &e_tlen);
+
+        if (fqdn_out && fqdn_cap > 1) {
+            size_t cp = f_tlen < fqdn_cap - 1 ? f_tlen : fqdn_cap - 1;
+            memcpy(fqdn_out, fqdn_p + f_off, cp);
+            fqdn_out[cp] = '\0';
+        }
+
+        if (ascii_eq_nocase(en_p + e_off, e_tlen, "FALSE")) {
+            if (flag_off_out) *flag_off_out = (size_t)((en_p + e_off) - buf);
+            if (flag_len_out) *flag_len_out = e_tlen;
+            return S2B_STATE_NEEDS_PATCH;
+        }
+        if (ascii_eq_nocase(en_p + e_off, e_tlen, "TRUE")) {
+            saw_already_enabled = 1;
+        }
+    }
+
+    return saw_already_enabled ? S2B_STATE_ALREADY_ENABLED : S2B_STATE_NO_STATIC_FQDN;
+}
+
+/* 检测 <epdg_addr_info> 是否配有非空静态 <fqdn> 及其启用状态；并输出解析到的 fqdn */
+static s2b_fqdn_state_t s2b_inspect_static_fqdn(const uint8_t *buf, size_t len,
+                                                char *fqdn_out, size_t fqdn_cap) {
+    return s2b_inspect_static_fqdn_loc(buf, len, fqdn_out, fqdn_cap, NULL, NULL);
+}
+
+/* 对存在非空 <fqdn> 且 <static_fqdn_enabled> 为 FALSE 的 XML 做最小字节替换（仅改 FALSE -> TRUE）：
+ * 成功生成新缓冲区返回 0，无需改动返回 1，参数/内存异常返回 -1。 */
+static int s2b_apply_static_fqdn_patch(const uint8_t *orig, size_t orig_len,
+                                       uint8_t **out_buf, size_t *out_len) {
+    if (!orig || !out_buf || !out_len) return -1;
+    *out_buf = NULL;
+    *out_len = 0;
+
+    size_t flag_off = 0, flag_len = 0;
+    s2b_fqdn_state_t st = s2b_inspect_static_fqdn_loc(orig, orig_len, NULL, 0, &flag_off, &flag_len);
+    if (st != S2B_STATE_NEEDS_PATCH) {
+        return 1;
+    }
+
+    size_t new_len = orig_len - flag_len + 4;
+    uint8_t *out = (uint8_t *)malloc(new_len + 1);
+    if (!out) return -1;
+
+    memcpy(out, orig, flag_off);
+    memcpy(out + flag_off, "TRUE", 4);
+    memcpy(out + flag_off + 4, orig + flag_off + flag_len, orig_len - flag_off - flag_len);
+    out[new_len] = '\0';
+
+    *out_buf = out;
+    *out_len = new_len;
+    return 0;
 }
 
 /* 对共享锁文件加阻塞互斥锁，保障与后台守护及 App 串行访问 /dev/diag 和 QMI 刷新 */
@@ -2221,7 +2423,88 @@ static int run_self_tests(void) {
     }
     close(sv[1]);
 
-    printf("SELF-TEST PASSED: all 10 INI/SE merge, diag-router/diagchar transport & QMI refresh cases OK\n");
+    /* 用例 11：iwlan_s2b_config.xml 静态 ePDG FQDN 定点解锁、空值跳过与白名单校验 */
+    const char *s2b_3hk =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><IWLAN_S2B_CONFIG>\r\n"
+        "    <GENERIC_VARIANT>\r\n"
+        "        <epdg_addr_info>\r\n"
+        "            <fqdn>wlan.three.com.hk</fqdn>\r\n"
+        "            <static_fqdn_enabled>FALSE</static_fqdn_enabled>\r\n"
+        "        </epdg_addr_info>\r\n"
+        "        <ikev2_info>\r\n"
+        "            <cert_req_enabled>FALSE</cert_req_enabled>\r\n"
+        "        </ikev2_info>\r\n"
+        "    </GENERIC_VARIANT>\r\n"
+        "</IWLAN_S2B_CONFIG>";
+    char fqdn_buf[128];
+    if (s2b_inspect_static_fqdn((const uint8_t *)s2b_3hk, strlen(s2b_3hk), fqdn_buf, sizeof(fqdn_buf)) != S2B_STATE_NEEDS_PATCH ||
+        strcmp(fqdn_buf, "wlan.three.com.hk") != 0) {
+        fprintf(stderr, "FAIL T11 inspect 3HK s2b\n"); return 1;
+    }
+    uint8_t *s2b_out = NULL;
+    size_t s2b_out_len = 0;
+    if (s2b_apply_static_fqdn_patch((const uint8_t *)s2b_3hk, strlen(s2b_3hk), &s2b_out, &s2b_out_len) != 0 ||
+        s2b_out_len != strlen(s2b_3hk) - 1 ||
+        !strstr((const char *)s2b_out, "<static_fqdn_enabled>TRUE</static_fqdn_enabled>") ||
+        !strstr((const char *)s2b_out, "<cert_req_enabled>FALSE</cert_req_enabled>") ||
+        !strstr((const char *)s2b_out, "\r\n")) {
+        free(s2b_out);
+        fprintf(stderr, "FAIL T11 apply 3HK s2b patch\n"); return 1;
+    }
+    if (s2b_inspect_static_fqdn(s2b_out, s2b_out_len, fqdn_buf, sizeof(fqdn_buf)) != S2B_STATE_ALREADY_ENABLED) {
+        free(s2b_out);
+        fprintf(stderr, "FAIL T11 post-patch inspect\n"); return 1;
+    }
+    uint8_t *s2b_idem = NULL;
+    size_t s2b_idem_len = 0;
+    if (s2b_apply_static_fqdn_patch(s2b_out, s2b_out_len, &s2b_idem, &s2b_idem_len) != 1 || s2b_idem != NULL) {
+        free(s2b_out);
+        free(s2b_idem);
+        fprintf(stderr, "FAIL T11 idempotent check\n"); return 1;
+    }
+    free(s2b_out);
+
+    const char *s2b_ct = "<IWLAN_S2B_CONFIG><GENERIC_VARIANT><epdg_addr_info><static_fqdn_enabled>FALSE</static_fqdn_enabled><plmn_list/></epdg_addr_info></GENERIC_VARIANT></IWLAN_S2B_CONFIG>";
+    const char *s2b_self = "<IWLAN_S2B_CONFIG><GENERIC_VARIANT><epdg_addr_info><fqdn/><static_fqdn_enabled>FALSE</static_fqdn_enabled></epdg_addr_info></GENERIC_VARIANT></IWLAN_S2B_CONFIG>";
+    const char *s2b_blank = "<IWLAN_S2B_CONFIG><GENERIC_VARIANT><epdg_addr_info><fqdn>  \t </fqdn><static_fqdn_enabled>FALSE</static_fqdn_enabled></epdg_addr_info></GENERIC_VARIANT></IWLAN_S2B_CONFIG>";
+    if (s2b_inspect_static_fqdn((const uint8_t *)s2b_ct, strlen(s2b_ct), fqdn_buf, sizeof(fqdn_buf)) != S2B_STATE_NO_STATIC_FQDN ||
+        s2b_inspect_static_fqdn((const uint8_t *)s2b_self, strlen(s2b_self), fqdn_buf, sizeof(fqdn_buf)) != S2B_STATE_NO_STATIC_FQDN ||
+        s2b_inspect_static_fqdn((const uint8_t *)s2b_blank, strlen(s2b_blank), fqdn_buf, sizeof(fqdn_buf)) != S2B_STATE_NO_STATIC_FQDN ||
+        s2b_apply_static_fqdn_patch((const uint8_t *)s2b_ct, strlen(s2b_ct), &s2b_idem, &s2b_idem_len) != 1) {
+        fprintf(stderr, "FAIL T11 skip empty/missing fqdn\n"); return 1;
+    }
+    if (!is_allowed_write_path(EFS_S2B_PATH_SLOT0) ||
+        !is_allowed_write_path(EFS_S2B_PATH_SLOT1) ||
+        is_allowed_write_path("/data/iwlan_s2b_config_Subscription01.xml")) {
+        fprintf(stderr, "FAIL T11 s2b whitelist guard\n"); return 1;
+    }
+
+    const char *s2b_vdf_comment =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><IWLAN_S2B_CONFIG>\r\n"
+        "    <GENERIC_VARIANT>\r\n"
+        "        <epdg_addr_info>\r\n"
+        "            <!--\r\n"
+        "            <static_fqdn_enabled>FALSE</static_fqdn_enabled>\r\n"
+        "            -->\r\n"
+        "            <static_fqdn_enabled>TRUE</static_fqdn_enabled>\r\n"
+        "            <fqdn>epdg.epc.mnc015.mcc234.pub.3gppnetwork.org</fqdn>\r\n"
+        "        </epdg_addr_info>\r\n"
+        "    </GENERIC_VARIANT>\r\n"
+        "</IWLAN_S2B_CONFIG>";
+    const char *s2b_commented_fqdn =
+        "<IWLAN_S2B_CONFIG><GENERIC_VARIANT><epdg_addr_info>"
+        "<!-- <fqdn>fake.example.com</fqdn> -->"
+        "<static_fqdn_enabled>FALSE</static_fqdn_enabled>"
+        "</epdg_addr_info></GENERIC_VARIANT></IWLAN_S2B_CONFIG>";
+    if (s2b_inspect_static_fqdn((const uint8_t *)s2b_vdf_comment, strlen(s2b_vdf_comment), fqdn_buf, sizeof(fqdn_buf)) != S2B_STATE_ALREADY_ENABLED ||
+        strcmp(fqdn_buf, "epdg.epc.mnc015.mcc234.pub.3gppnetwork.org") != 0 ||
+        s2b_apply_static_fqdn_patch((const uint8_t *)s2b_vdf_comment, strlen(s2b_vdf_comment), &s2b_idem, &s2b_idem_len) != 1 ||
+        s2b_inspect_static_fqdn((const uint8_t *)s2b_commented_fqdn, strlen(s2b_commented_fqdn), fqdn_buf, sizeof(fqdn_buf)) != S2B_STATE_NO_STATIC_FQDN ||
+        s2b_apply_static_fqdn_patch((const uint8_t *)s2b_commented_fqdn, strlen(s2b_commented_fqdn), &s2b_idem, &s2b_idem_len) != 1) {
+        fprintf(stderr, "FAIL T11 xml comment ignore guard\n"); return 1;
+    }
+
+    printf("SELF-TEST PASSED: all 11 INI/SE/S2B merge, diag-router/diagchar transport & QMI refresh cases OK\n");
     return 0;
 }
 
@@ -2347,6 +2630,59 @@ static int patch_one_se_target(const diag_ctx_t *ctx, const slot_target_t *slot,
     printf("PATCHED %s -> %zu bytes (wfc=0x%02x pref=0x%02x roam=0x%02x)\n",
            slot->se_path, se_len, se_mod[8], se_mod[9], se_mod[13]);
     free(se_mod);
+    (*changed)++;
+    return 0;
+}
+
+/* 对单槽 iwlan_s2b_config.xml 按需启用静态 ePDG FQDN（仅含非空 <fqdn> 时修改）：返回 0 成功/跳过，-1 失败。 */
+static int patch_one_s2b_target(const diag_ctx_t *ctx, const slot_target_t *slot,
+                                const char *backup_dir, int *changed) {
+    uint8_t *s2b_orig = NULL;
+    size_t s2b_len = 0;
+    int sr = efs_read_all_mem(ctx, slot->s2b_path, &s2b_orig, &s2b_len);
+    if (sr == -2) {
+        printf("%s (%s): SKIP (not found)\n", slot->s2b_backup_prefix, slot->s2b_path);
+        return 0;
+    }
+    if (sr != 0) {
+        fprintf(stderr, "%s (%s): READ_ERROR\n", slot->s2b_backup_prefix, slot->s2b_path);
+        return -1;
+    }
+
+    char fqdn[128];
+    s2b_fqdn_state_t st = s2b_inspect_static_fqdn(s2b_orig, s2b_len, fqdn, sizeof(fqdn));
+    if (st == S2B_STATE_NO_STATIC_FQDN) {
+        printf("%s (%s): SKIP (no static fqdn)\n", slot->s2b_backup_prefix, slot->s2b_path);
+        free(s2b_orig);
+        return 0;
+    }
+    if (st == S2B_STATE_ALREADY_ENABLED) {
+        printf("%s (%s): ALREADY_PATCHED (fqdn=%s static_fqdn=TRUE)\n",
+               slot->s2b_backup_prefix, slot->s2b_path, fqdn);
+        free(s2b_orig);
+        return 0;
+    }
+
+    if (backup_original_if_needed(backup_dir, slot->s2b_backup_prefix, s2b_orig, s2b_len) != 0) {
+        free(s2b_orig);
+        return -1;
+    }
+
+    uint8_t *s2b_new = NULL;
+    size_t s2b_new_len = 0;
+    if (s2b_apply_static_fqdn_patch(s2b_orig, s2b_len, &s2b_new, &s2b_new_len) != 0) {
+        free(s2b_orig);
+        return -1;
+    }
+    free(s2b_orig);
+
+    if (efs_write_and_verify(ctx, slot->s2b_path, s2b_new, s2b_new_len) != 0) {
+        free(s2b_new);
+        return -1;
+    }
+    printf("PATCHED %s -> %zu bytes (fqdn=%s static_fqdn=TRUE)\n",
+           slot->s2b_path, s2b_new_len, fqdn);
+    free(s2b_new);
     (*changed)++;
     return 0;
 }
@@ -2535,6 +2871,7 @@ int main(int argc, char **argv) {
             if (rr == -2) {
                 printf("%s (%s): NOT_FOUND\n", slots[i].slot_name, slots[i].efs_path);
                 printf("%s (%s): SKIP_INACTIVE\n", slots[i].se_backup_prefix, slots[i].se_path);
+                printf("%s (%s): SKIP_INACTIVE\n", slots[i].s2b_backup_prefix, slots[i].s2b_path);
                 continue;
             } else if (rr != 0) {
                 printf("%s (%s): READ_ERROR\n", slots[i].slot_name, slots[i].efs_path);
@@ -2564,6 +2901,30 @@ int main(int argc, char **argv) {
                        se_need ? "UNPATCHED" : "ALREADY_PATCHED");
             }
             free(se_buf);
+
+            /* 活跃卡槽同步检查 iwlan_s2b_config.xml 静态 ePDG FQDN 开关 */
+            uint8_t *s2b_buf = NULL;
+            size_t s2b_len = 0;
+            int s2r = efs_read_all_mem(&ctx, slots[i].s2b_path, &s2b_buf, &s2b_len);
+            if (s2r == -2) {
+                printf("%s (%s): NOT_FOUND\n", slots[i].s2b_backup_prefix, slots[i].s2b_path);
+            } else if (s2r != 0) {
+                printf("%s (%s): READ_ERROR\n", slots[i].s2b_backup_prefix, slots[i].s2b_path);
+                rc = 1;
+            } else {
+                char fqdn[128];
+                s2b_fqdn_state_t st = s2b_inspect_static_fqdn(s2b_buf, s2b_len, fqdn, sizeof(fqdn));
+                if (st == S2B_STATE_NO_STATIC_FQDN) {
+                    printf("%s (%s): size=%zu SKIP_NO_FQDN\n",
+                           slots[i].s2b_backup_prefix, slots[i].s2b_path, s2b_len);
+                } else {
+                    printf("%s (%s): size=%zu fqdn=%s static_fqdn=%s status=%s\n",
+                           slots[i].s2b_backup_prefix, slots[i].s2b_path, s2b_len, fqdn,
+                           (st == S2B_STATE_ALREADY_ENABLED) ? "TRUE" : "FALSE",
+                           (st == S2B_STATE_ALREADY_ENABLED) ? "ALREADY_PATCHED" : "UNPATCHED");
+                }
+            }
+            free(s2b_buf);
         }
     } else if (strcmp(cmd, "patch") == 0) {
         const slot_target_t *slots = NULL;
@@ -2582,6 +2943,9 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (patch_one_se_target(&ctx, &slots[i], backup_dir, &changed) != 0) {
+                rc = 1;
+            }
+            if (patch_one_s2b_target(&ctx, &slots[i], backup_dir, &changed) != 0) {
                 rc = 1;
             }
         }
@@ -2604,6 +2968,9 @@ int main(int argc, char **argv) {
                 rc = 1;
             }
             if (restore_one_target(&ctx, backup_dir, slots[i].se_backup_prefix, slots[i].se_path, &changed) != 0) {
+                rc = 1;
+            }
+            if (restore_one_target(&ctx, backup_dir, slots[i].s2b_backup_prefix, slots[i].s2b_path, &changed) != 0) {
                 rc = 1;
             }
         }

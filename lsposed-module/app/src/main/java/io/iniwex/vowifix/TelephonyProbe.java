@@ -59,6 +59,35 @@ public final class TelephonyProbe {
             return !simNumeric.substring(0, 3).equals(netNumeric.substring(0, 3));
         }
 
+        public SlotSnapshot withImsType(String newImsType) {
+            return new SlotSnapshot(
+                    slotIndex,
+                    simState,
+                    simAlpha,
+                    simNumeric,
+                    simIso,
+                    netAlpha,
+                    netNumeric,
+                    netType,
+                    newImsType == null ? "" : newImsType.trim()
+            );
+        }
+
+        public boolean hasCellularNetwork() {
+            return netNumeric.length() >= 3;
+        }
+
+        public boolean isHomeCellular() {
+            if (!isSimLoaded() || simNumeric.length() < 3 || netNumeric.length() < 3) {
+                return false;
+            }
+            return simNumeric.substring(0, 3).equals(netNumeric.substring(0, 3));
+        }
+
+        public boolean isIwlanOnly() {
+            return !hasCellularNetwork() && (isVoWiFi() || "IWLAN".equalsIgnoreCase(netType));
+        }
+
         public String getImsBadgeText() {
             if (isVoWiFi()) {
                 return "VoWiFi";
@@ -150,6 +179,22 @@ public final class TelephonyProbe {
     private static final Pattern INI_LINE = Pattern.compile("^(slot[01]) \\([^)]+\\): (.*)$");
     private static final Pattern SE_LINE = Pattern.compile("^(slot[01])_se \\([^)]+\\): (.*)$");
 
+    private static final Pattern IMS_PHONE_ID_LINE = Pattern.compile("^mPhoneId\\s*=\\s*(\\d+)$");
+    private static final Pattern IMS_REG_BOOL_LINE = Pattern.compile("^mImsRegistered\\s*=\\s*(true|false)$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern IMS_MMTEL_STATE_LINE = Pattern.compile("^mImsMmTelRegistrationState\\s*=\\s*([A-Za-z0-9_]+)");
+    private static final Pattern IMS_SS_DATA_TECH = Pattern.compile("getRilDataRadioTechnology=([^,}\\s]+)");
+    private static final Pattern IMS_SS_VOICE_TECH = Pattern.compile("getRilVoiceRadioTechnology=([^,}\\s]+)");
+    private static final Pattern IMS_TRANSPORT_TYPE = Pattern.compile("imsTransportType=([A-Za-z0-9_]+)");
+    private static final Pattern IMS_RADIO_TECH = Pattern.compile("imsRadioTech=([A-Za-z0-9_]+)");
+
+    // 进程内缓存最近一次通过 Root 解析得到的 IMS 类型，供快捷磁贴与无 Root 状态复用
+    private static final long IMS_CACHE_TTL_MS = 5 * 60 * 1000L;
+    private static final Object IMS_CACHE_LOCK = new Object();
+    private static final String[] CACHED_IMS_TYPES = new String[]{"", ""};
+    private static final String[] CACHED_SIM_NUMERICS = new String[]{"", ""};
+    private static final String[] CACHED_NET_TYPES = new String[]{"", ""};
+    private static final long[] CACHED_IMS_TS = new long[]{0L, 0L};
+
     private TelephonyProbe() {
     }
 
@@ -177,9 +222,32 @@ public final class TelephonyProbe {
     }
 
     /**
-     * 仅通过 SystemProperties 采集双卡可见状态（零 Root 权限下也可即时运行）。
+     * 缓存最新解析到的双卡 IMS 状态，供跨组件无 Root 读取复用。
      */
-    public static SlotSnapshot[] readPublicSlotSnapshots() {
+    public static void cacheResolvedImsTypes(SlotSnapshot[] slots) {
+        if (slots == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        synchronized (IMS_CACHE_LOCK) {
+            int count = Math.min(2, slots.length);
+            for (int i = 0; i < count; i++) {
+                SlotSnapshot slot = slots[i];
+                if (slot == null) {
+                    continue;
+                }
+                CACHED_IMS_TYPES[i] = slot.imsType == null ? "" : slot.imsType.trim();
+                CACHED_SIM_NUMERICS[i] = slot.simNumeric == null ? "" : slot.simNumeric.trim();
+                CACHED_NET_TYPES[i] = slot.netType == null ? "" : slot.netType.trim();
+                CACHED_IMS_TS[i] = now;
+            }
+        }
+    }
+
+    /**
+     * 仅原样读取 SystemProperties，不做任何缓存回填或网络类型推断。
+     */
+    private static SlotSnapshot[] readRawPublicSlotSnapshots() {
         SlotSnapshot[] res = new SlotSnapshot[2];
         for (int i = 0; i < 2; i++) {
             res[i] = new SlotSnapshot(
@@ -195,6 +263,44 @@ public final class TelephonyProbe {
             );
         }
         return res;
+    }
+
+    /**
+     * 在非 Oplus 机型缺少 gsm.ims.type* 时，优先复用进程内缓存，否则仅对 IWLAN 做温和兜底。
+     */
+    private static SlotSnapshot applyPublicImsFallback(SlotSnapshot slot) {
+        if (slot == null || !slot.imsType.isEmpty() || !slot.isSimLoaded()) {
+            return slot;
+        }
+        int idx = slot.slotIndex;
+        if (idx >= 0 && idx < 2) {
+            long now = System.currentTimeMillis();
+            synchronized (IMS_CACHE_LOCK) {
+                long ts = CACHED_IMS_TS[idx];
+                if (ts > 0L
+                        && (now - ts) >= 0L
+                        && (now - ts) <= IMS_CACHE_TTL_MS
+                        && slot.simNumeric.equals(CACHED_SIM_NUMERICS[idx])
+                        && slot.netType.equalsIgnoreCase(CACHED_NET_TYPES[idx])) {
+                    return slot.withImsType(CACHED_IMS_TYPES[idx]);
+                }
+            }
+        }
+        if ("IWLAN".equalsIgnoreCase(slot.netType)) {
+            return slot.withImsType("vowifi");
+        }
+        return slot;
+    }
+
+    /**
+     * 仅通过 SystemProperties 与进程内缓存采集双卡可见状态（零 Root 权限下也可即时运行）。
+     */
+    public static SlotSnapshot[] readPublicSlotSnapshots() {
+        SlotSnapshot[] raw = readRawPublicSlotSnapshots();
+        for (int i = 0; i < raw.length; i++) {
+            raw[i] = applyPublicImsFallback(raw[i]);
+        }
+        return raw;
     }
 
     /**
@@ -231,9 +337,12 @@ public final class TelephonyProbe {
         FullSnapshot snap = new FullSnapshot();
         snap.lsposedActive = ActivationStatus.isModuleActive();
         snap.baseband = getProp("gsm.version.baseband", "");
-        snap.slots = readPublicSlotSnapshots();
+        SlotSnapshot[] rawSlots = readRawPublicSlotSnapshots();
         snap.hasRoot = RootShell.checkRoot();
         if (!snap.hasRoot) {
+            for (int i = 0; i < rawSlots.length; i++) {
+                snap.slots[i] = applyPublicImsFallback(rawSlots[i]);
+            }
             snap.efs[0].iniState = "需要 Root 权限";
             snap.efs[0].seState = "需要 Root 权限";
             snap.efs[1].iniState = "需要 Root 权限";
@@ -241,35 +350,66 @@ public final class TelephonyProbe {
             return snap;
         }
 
-        // 先读取纯文件状态、无副作用后端探测与日志（不打开 Diag 通道）
-        String metaScript = RootShell.resolveBinarySnippet()
-                + "MOD_OK=0; [ -d '" + RootShell.MODULE_DIR + "' ] && MOD_OK=1\n"
-                + "BIN_OK=0; [ -n \"$BIN\" ] && BIN_OK=1\n"
-                + "WATCH_EN=1; [ -f '" + RootShell.DISABLED_FLAG + "' ] && WATCH_EN=0\n"
-                + "WATCH_RUN=0\n"
-                + "if [ -f '" + RootShell.PID_PATH + "' ]; then\n"
-                + "  WPID=$(cat '" + RootShell.PID_PATH + "' 2>/dev/null)\n"
-                + "  if [ -n \"$WPID\" ] && [ -r \"/proc/$WPID/cmdline\" ]; then\n"
-                + "    tr '\\0' ' ' < \"/proc/$WPID/cmdline\" 2>/dev/null | grep -q 'service.sh' && WATCH_RUN=1\n"
-                + "  fi\n"
-                + "fi\n"
-                + "BKD='unknown'\n"
-                + "if [ -n \"$BIN\" ]; then\n"
-                + "  DET=$(\"$BIN\" detect 2>/dev/null | head -n 1)\n"
-                + "  BKD=\"${DET#BACKEND=}\"\n"
-                + "  [ -n \"$BKD\" ] || BKD='none'\n"
-                + "fi\n"
-                + "echo \"META:$MOD_OK:$BIN_OK:$WATCH_EN:$WATCH_RUN:$BKD\"\n"
-                + "echo '===LOG_BEGIN==='\n"
-                + "[ -f '" + RootShell.LOG_PATH + "' ] && tail -n 60 '" + RootShell.LOG_PATH + "' 2>/dev/null\n"
-                + "echo '===LOG_END==='\n";
+        // 仅当存在已加载但缺少 Oplus gsm.ims.type* 属性的 SIM 卡时，按需附加 AOSP ImsPhone 探测
+        boolean needImsDump = (rawSlots[0].isSimLoaded() && rawSlots[0].imsType.isEmpty())
+                || (rawSlots[1].isSimLoaded() && rawSlots[1].imsType.isEmpty());
 
-        RootShell.Result mr = RootShell.execRoot(metaScript, 8);
+        // 先读取纯文件状态、无副作用后端探测与日志（不打开 Diag 通道）
+        StringBuilder metaScript = new StringBuilder();
+        metaScript.append(RootShell.resolveBinarySnippet())
+                .append("MOD_OK=0; [ -d '").append(RootShell.MODULE_DIR).append("' ] && MOD_OK=1\n")
+                .append("BIN_OK=0; [ -n \"$BIN\" ] && BIN_OK=1\n")
+                .append("WATCH_EN=1; [ -f '").append(RootShell.DISABLED_FLAG).append("' ] && WATCH_EN=0\n")
+                .append("WATCH_RUN=0\n")
+                .append("if [ -f '").append(RootShell.PID_PATH).append("' ]; then\n")
+                .append("  WPID=$(cat '").append(RootShell.PID_PATH).append("' 2>/dev/null)\n")
+                .append("  if [ -n \"$WPID\" ] && [ -r \"/proc/$WPID/cmdline\" ]; then\n")
+                .append("    tr '\\0' ' ' < \"/proc/$WPID/cmdline\" 2>/dev/null | grep -q 'service.sh' && WATCH_RUN=1\n")
+                .append("  fi\n")
+                .append("fi\n")
+                .append("BKD='unknown'\n")
+                .append("if [ -n \"$BIN\" ]; then\n")
+                .append("  DET=$(\"$BIN\" detect 2>/dev/null | head -n 1)\n")
+                .append("  BKD=\"${DET#BACKEND=}\"\n")
+                .append("  [ -n \"$BKD\" ] || BKD='none'\n")
+                .append("fi\n")
+                .append("echo \"META:$MOD_OK:$BIN_OK:$WATCH_EN:$WATCH_RUN:$BKD\"\n")
+                .append("echo '===LOG_BEGIN==='\n")
+                .append("[ -f '").append(RootShell.LOG_PATH).append("' ] && tail -n 60 '").append(RootShell.LOG_PATH).append("' 2>/dev/null\n")
+                .append("echo '===LOG_END==='\n");
+        if (needImsDump) {
+            metaScript.append("echo '===IMS_DUMP_BEGIN==='\n")
+                    .append("dumpsys activity service com.android.phone/.TelephonyDebugService 2>/dev/null")
+                    .append(" | grep -F -e 'ImsPhone extends:' -e 'mPhoneId=' -e 'mPhoneId ='")
+                    .append(" -e 'mImsRegistered=' -e 'ImsPhone:' -e 'mImsMmTelRegistrationState'")
+                    .append(" -e ' mSS =' -e 'onImsMmTelConnected' -e 'handleImsRegistered:' || true\n")
+                    .append("echo '===IMS_DUMP_END==='\n");
+        }
+
+        String imsDump = "";
+        RootShell.Result mr = RootShell.execRoot(metaScript.toString(), 10);
         if (mr.isSuccess()) {
-            parseMetaAndLog(mr.stdout, snap);
+            imsDump = parseMetaAndLog(mr.stdout, snap);
         } else {
             snap.errorNote = mr.stderr;
         }
+
+        String[] parsedIms = needImsDump ? parseImsTypesFromDebugDump(imsDump, rawSlots) : new String[2];
+        for (int i = 0; i < rawSlots.length; i++) {
+            SlotSnapshot slot = rawSlots[i];
+            if (!slot.imsType.isEmpty() || !slot.isSimLoaded()) {
+                snap.slots[i] = slot;
+            } else if (parsedIms[i] != null) {
+                // 信任 ImsPhone 的实时权威注册状态（包括明确的未注册 ""）
+                snap.slots[i] = slot.withImsType(parsedIms[i]);
+            } else if ("IWLAN".equalsIgnoreCase(slot.netType)) {
+                // 当 ROM 禁用或缺少 TelephonyDebugService 时温和兜底 IWLAN
+                snap.slots[i] = slot.withImsType("vowifi");
+            } else {
+                snap.slots[i] = slot;
+            }
+        }
+        cacheResolvedImsTypes(snap.slots);
 
         if (snap.binaryAvailable && !snap.hasDiagBackend()) {
             snap.efs[0].iniState = EfsSlotStatus.STATE_NO_DIAG;
@@ -301,17 +441,33 @@ public final class TelephonyProbe {
         return snap;
     }
 
-    private static void parseMetaAndLog(String out, FullSnapshot snap) {
+    static String parseMetaAndLog(String out, FullSnapshot snap) {
+        if (out == null) {
+            snap.serviceLog = "";
+            return "";
+        }
         String[] lines = out.split("\n");
         boolean inLog = false;
+        boolean inImsDump = false;
         StringBuilder logSb = new StringBuilder();
+        StringBuilder imsSb = new StringBuilder();
         for (String line : lines) {
             if ("===LOG_BEGIN===".equals(line)) {
                 inLog = true;
+                inImsDump = false;
                 continue;
             }
             if ("===LOG_END===".equals(line)) {
                 inLog = false;
+                continue;
+            }
+            if ("===IMS_DUMP_BEGIN===".equals(line)) {
+                inImsDump = true;
+                inLog = false;
+                continue;
+            }
+            if ("===IMS_DUMP_END===".equals(line)) {
+                inImsDump = false;
                 continue;
             }
             if (inLog) {
@@ -319,6 +475,13 @@ public final class TelephonyProbe {
                     logSb.append('\n');
                 }
                 logSb.append(line);
+                continue;
+            }
+            if (inImsDump) {
+                if (imsSb.length() > 0) {
+                    imsSb.append('\n');
+                }
+                imsSb.append(line);
                 continue;
             }
             if (line.startsWith("META:")) {
@@ -335,6 +498,229 @@ public final class TelephonyProbe {
             }
         }
         snap.serviceLog = logSb.toString();
+        return imsSb.toString();
+    }
+
+    /**
+     * 解析 AOSP TelephonyDebugService 中双卡 ImsPhone 的实时注册状态与传输类型。
+     * 无法在 dump 中匹配到对应槽位时保持 null，已匹配到但未注册时返回 ""。
+     */
+    public static String[] parseImsTypesFromDebugDump(String dump, SlotSnapshot[] slots) {
+        String[] results = new String[]{null, null};
+        if (dump == null || dump.trim().isEmpty()) {
+            return results;
+        }
+        boolean[] strongParsed = new boolean[]{false, false};
+
+        int currentSlot = -1;
+        boolean inImsBody = false;
+        boolean hasImsRegistered = false;
+        boolean imsRegistered = false;
+        String mmTelRegState = "";
+        String ssDataTech = "";
+        String ssVoiceTech = "";
+        String lastRegLine = "";
+
+        for (String rawLine : dump.split("\n")) {
+            String trimmed = rawLine.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (trimmed.startsWith("ImsPhone extends:")) {
+                // 若此前已进入过 ImsPhone 主体却未见外层 mPhoneId，先行结算上一槽位
+                if (inImsBody && currentSlot >= 0 && currentSlot < 2) {
+                    commitImsBlock(results, strongParsed, slots, currentSlot, inImsBody,
+                            hasImsRegistered, imsRegistered, mmTelRegState, ssDataTech, ssVoiceTech, lastRegLine);
+                    currentSlot = -1;
+                    inImsBody = false;
+                    hasImsRegistered = false;
+                    imsRegistered = false;
+                    mmTelRegState = "";
+                    ssDataTech = "";
+                    ssVoiceTech = "";
+                    lastRegLine = "";
+                }
+                continue;
+            }
+            Matcher mPid = IMS_PHONE_ID_LINE.matcher(trimmed);
+            if (mPid.matches()) {
+                int pid;
+                try {
+                    pid = Integer.parseInt(mPid.group(1));
+                } catch (NumberFormatException ignored) {
+                    continue;
+                }
+                if (pid < 0 || pid >= 2) {
+                    continue;
+                }
+                // 仅在已经进入过 ImsPhone 主体后遇到新 mPhoneId，或槽位号变化时才切槽位；
+                // 避免在 ImsPhone extends: 与 ImsPhone: 之间的同槽位 CallTracker mPhoneId 处误重置
+                if (currentSlot >= 0 && (inImsBody || pid != currentSlot)) {
+                    commitImsBlock(results, strongParsed, slots, currentSlot, inImsBody,
+                            hasImsRegistered, imsRegistered, mmTelRegState, ssDataTech, ssVoiceTech, lastRegLine);
+                    inImsBody = false;
+                    hasImsRegistered = false;
+                    imsRegistered = false;
+                    mmTelRegState = "";
+                    ssDataTech = "";
+                    ssVoiceTech = "";
+                    lastRegLine = "";
+                }
+                currentSlot = pid;
+                continue;
+            }
+            if (trimmed.startsWith("ImsPhone:")) {
+                inImsBody = true;
+                continue;
+            }
+            if (currentSlot < 0 || currentSlot >= 2) {
+                continue;
+            }
+
+            Matcher mRegBool = IMS_REG_BOOL_LINE.matcher(trimmed);
+            if (mRegBool.matches()) {
+                hasImsRegistered = true;
+                imsRegistered = "true".equalsIgnoreCase(mRegBool.group(1));
+                continue;
+            }
+            Matcher mMmTel = IMS_MMTEL_STATE_LINE.matcher(trimmed);
+            if (mMmTel.find()) {
+                mmTelRegState = mMmTel.group(1).trim();
+                continue;
+            }
+            if (trimmed.startsWith("mSS =") || trimmed.startsWith("mServiceState=") || trimmed.startsWith("service state=")) {
+                Matcher mData = IMS_SS_DATA_TECH.matcher(trimmed);
+                if (mData.find()) {
+                    ssDataTech = mData.group(1).trim();
+                }
+                Matcher mVoice = IMS_SS_VOICE_TECH.matcher(trimmed);
+                if (mVoice.find()) {
+                    ssVoiceTech = mVoice.group(1).trim();
+                }
+                continue;
+            }
+            if ((trimmed.contains("onImsMmTelConnected") || trimmed.contains("handleImsRegistered:"))
+                    && !trimmed.contains("Unregistered")
+                    && !trimmed.contains("Disconnected")) {
+                lastRegLine = trimmed;
+            }
+        }
+
+        if (currentSlot >= 0 && currentSlot < 2) {
+            commitImsBlock(results, strongParsed, slots, currentSlot, inImsBody,
+                    hasImsRegistered, imsRegistered, mmTelRegState, ssDataTech, ssVoiceTech, lastRegLine);
+        }
+        return results;
+    }
+
+    private static void commitImsBlock(
+            String[] results,
+            boolean[] strongParsed,
+            SlotSnapshot[] slots,
+            int slotIndex,
+            boolean inImsBody,
+            boolean hasImsRegistered,
+            boolean imsRegistered,
+            String mmTelRegState,
+            String ssDataTech,
+            String ssVoiceTech,
+            String lastRegLine) {
+        boolean hasEvidence = inImsBody || hasImsRegistered || !mmTelRegState.isEmpty()
+                || !ssDataTech.isEmpty() || !ssVoiceTech.isEmpty() || !lastRegLine.isEmpty();
+        if (!hasEvidence) {
+            return;
+        }
+        boolean isStrong = inImsBody || !mmTelRegState.isEmpty()
+                || !ssDataTech.isEmpty() || !ssVoiceTech.isEmpty() || !lastRegLine.isEmpty();
+        if (!isStrong && strongParsed[slotIndex]) {
+            return;
+        }
+        String slotNetType = (slots != null && slotIndex < slots.length && slots[slotIndex] != null)
+                ? slots[slotIndex].netType : "";
+        results[slotIndex] = resolveSlotImsType(
+                hasImsRegistered, imsRegistered, mmTelRegState, ssDataTech, ssVoiceTech, lastRegLine, slotNetType);
+        if (isStrong) {
+            strongParsed[slotIndex] = true;
+        }
+    }
+
+    private static String resolveSlotImsType(
+            boolean hasImsRegistered,
+            boolean imsRegistered,
+            String mmTelRegState,
+            String ssDataTech,
+            String ssVoiceTech,
+            String lastRegLine,
+            String slotNetType) {
+        boolean registered;
+        if (!mmTelRegState.isEmpty()) {
+            registered = "2".equals(mmTelRegState)
+                    || "REGISTERED".equalsIgnoreCase(mmTelRegState)
+                    || "REGISTRATION_STATE_REGISTERED".equalsIgnoreCase(mmTelRegState);
+        } else {
+            registered = hasImsRegistered && imsRegistered;
+        }
+        if (!registered) {
+            return "";
+        }
+
+        boolean nrActive = containsNrTech(ssDataTech) || containsNrTech(ssVoiceTech) || containsNrTech(slotNetType);
+
+        if (!lastRegLine.isEmpty()) {
+            Matcher mTr = IMS_TRANSPORT_TYPE.matcher(lastRegLine);
+            if (mTr.find()) {
+                String upper = mTr.group(1).toUpperCase(Locale.US);
+                if (upper.contains("WLAN") || upper.contains("WIFI") || upper.contains("CROSS_SIM") || "2".equals(upper)) {
+                    return "vowifi";
+                }
+                if (upper.contains("WWAN") || "1".equals(upper)) {
+                    return nrActive ? "vonr" : "volte";
+                }
+            }
+            Matcher mRt = IMS_RADIO_TECH.matcher(lastRegLine);
+            if (mRt.find()) {
+                String upper = mRt.group(1).toUpperCase(Locale.US);
+                if (upper.contains("WLAN") || upper.contains("IWLAN") || upper.contains("WIFI")
+                        || upper.contains("CROSS_SIM") || "1".equals(upper) || "2".equals(upper)) {
+                    return "vowifi";
+                }
+                if (upper.contains("NR") || "3".equals(upper)) {
+                    return "vonr";
+                }
+                return nrActive ? "vonr" : "volte";
+            }
+        }
+
+        if (containsWlanTech(ssDataTech) || containsWlanTech(ssVoiceTech)) {
+            return "vowifi";
+        }
+        if (containsNrTech(ssDataTech) || containsNrTech(ssVoiceTech)) {
+            return "vonr";
+        }
+        if ("IWLAN".equalsIgnoreCase(slotNetType)) {
+            return "vowifi";
+        }
+        if (containsNrTech(slotNetType)) {
+            return "vonr";
+        }
+        return "volte";
+    }
+
+    private static boolean containsWlanTech(String tech) {
+        if (tech == null || tech.isEmpty()) {
+            return false;
+        }
+        String upper = tech.toUpperCase(Locale.US);
+        return upper.contains("IWLAN") || upper.contains("WLAN") || upper.contains("WIFI")
+                || upper.startsWith("18(") || "18".equals(upper);
+    }
+
+    private static boolean containsNrTech(String tech) {
+        if (tech == null || tech.isEmpty()) {
+            return false;
+        }
+        String upper = tech.toUpperCase(Locale.US);
+        return upper.contains("NR") || upper.startsWith("20(") || "20".equals(upper);
     }
 
     public static void parseEfsStatusOutput(String out, EfsSlotStatus[] efs) {

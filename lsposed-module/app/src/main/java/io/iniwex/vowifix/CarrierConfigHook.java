@@ -61,8 +61,8 @@ public final class CarrierConfigHook {
         bundle.putBoolean("imsserviceentitlement.default_service_entitlement_status_bool", true);
         bundle.putBoolean("hide_ims_apn_bool", false);
 
-        // 强制 ePDG 优先使用 Home PLMN (1 = EPDG_ADDRESS_PLMN)
-        bundle.putIntArray("iwlan.epdg_address_priority_int_array", new int[]{1});
+        // 优先使用静态 ePDG 地址，缺失时回退 Home PLMN (0 = STATIC, 1 = PLMN)
+        bundle.putIntArray("iwlan.epdg_address_priority_int_array", new int[]{0, 1});
 
         // ColorOS / Oplus 专有显隐及模式解锁键
         bundle.putInt("vowifi_preferred_hide_mode", 0);

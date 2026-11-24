@@ -164,7 +164,7 @@ apply_patch_and_refresh() {
             # 仅按实际被写入变更的卡槽选择性触发 QMI 热刷新，热插副卡时不打断主卡在线状态
             CHG_S0=0
             CHG_S1=0
-            printf '%s\n' "$OUT" | grep -qE "(/efsprofiles/overideconfig|/nv/item_files/ims/qp_ims_service_enablement_config) ->" && CHG_S0=1
+            printf '%s\n' "$OUT" | grep -qE "(/efsprofiles/overideconfig|/nv/item_files/ims/qp_ims_service_enablement_config|/data/iwlan_s2b_config\.xml) ->" && CHG_S0=1
             printf '%s\n' "$OUT" | grep -q "_Subscription01 ->" && CHG_S1=1
             if [ "$CHG_S0" -eq 1 ] && [ "$CHG_S1" -eq 0 ]; then
                 REFRESH_TARGET="slot0"

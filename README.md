@@ -10,16 +10,16 @@ VoWiFiX 将 **Root 基带 EFS 层工具**（`vowifix-efs` + 切卡自动守护�
 
 - **双层基带 EFS 安全合并与漫游解锁**
   - 原生支持高通传统 `/dev/diag` (`diagchar`) 与 GKI 新平台 `diag-router`（`AF_UNIX` `SOCK_SEQPACKET`）双后端自动探测（`EFS2_DIAG_*`），对 `/efsprofiles/overideconfig`（及双卡副槽 `_Subscription01`）执行只增不毁、逐字节校验的 `6` 键通用配置合并，保留各卡原有 APN/端口/加密策略不变；
-  - 同步对活跃槽位 `/nv/item_files/ims/qp_ims_service_enablement_config` 执行最小 `3` 字节解锁（启用 Wi-Fi 通话总开关、将移动网络优先改回 Wi-Fi 优先、解除漫游强制禁用 VoWiFi），破除部分海外或漫游 SIM 卡的基带硬锁。
+  - 同步对活跃槽位 `/nv/item_files/ims/qp_ims_service_enablement_config` 执行最小 `3` 字节解锁（启用 Wi-Fi 通话总开关、将移动网络优先改回 Wi-Fi 优先、解除漫游强制禁用 VoWiFi），并对存在静态 `<fqdn>` 但原厂关闭开关的 `/data/iwlan_s2b_config.xml`（及副槽 `_Subscription01`）执行 XML 注释感知静态 FQDN 解锁，打通如香港 3HK 等依赖静态 ePDG 域名的运营商；
 - **跨卡热切换免重启自适应**
   - 常驻守护进程监听双卡 `gsm.sim.state` 与 `MCC/MNC` 变动，在切卡或漫游就绪后自动完成 EFS 合并、`telephony/siminfo` 历史策略校准，并通过 Qualcomm `QRTR` (`AF_QIPCRTR`) 按变更卡槽下发 `QMI_VS` 订阅绑定（`0x0021`）+ `0x008e` 独立/双槽热刷新（热插副卡时不打断主卡在线状态），无需重启即可生效；
   - 自 `v1.0.1` 起引入多后端 Diag 传输层抽象与无副作用探测（`vowifix-efs detect`）：单文件静态二进制即可自动适配旧平台 `/dev/diag` 与骁龙 8 Gen 2 / 8 Gen 3 / 8 Elite 等 GKI 新平台的 `diag-router`；对极少数完全封禁 Diag 的商用 ROM 也会优雅切换至“上层解锁 + `siminfo` 校准 + QRTR 刷新”模式，消除开机等待超时与报错刷屏。
 - **LSPosed 全作用域解锁与按槽伪装**
-  - 绕过系统/ColorOS `CarrierConfig` 开关隐藏、Entitlement/Provisioning 云端资格校验，强制 `WIFI_PREFERRED` 与 `EPDG_ADDRESS_PLMN`；开启 `wfc_carrier_name_override_by_pnn_bool` 与双架构归属运营商名防空兜底，修复无 `EF_SPN` 卡在漫游 VoWiFi 下显示驻留基站名称的问题；
+  - 绕过系统/ColorOS `CarrierConfig` 开关隐藏、Entitlement/Provisioning 云端资格校验，强制 `WIFI_PREFERRED`、`EPDG_ADDRESS_PLMN` 与 `{0, 1}` 地址优先级（静态配置优先、PLMN 回退）；开启 `wfc_carrier_name_override_by_pnn_bool` 与双架构归属运营商名防空兜底，修复无 `EF_SPN` 卡在漫游 VoWiFi 下显示驻留基站名称的问题；
   - 按卡槽自适应返回 SIM 归属 ISO 国家码并拦截基站/Wi-Fi PANI/CNI/地理位置上报（同时保留真实 `NITZ` 时区判定不受干扰）。
 - **轻量原生控制台与快捷磁贴（`~100 KB`）**
   - 纯 Java 17 + Android 原生 View 零三方库实现，支持系统浅色/深色主题自适应与 Edge-to-Edge 安全区适配；
-  - 内置框架激活自检、后台守护开关、双卡与 EFS 状态诊断、一键热适配（含 `6s` 落盘倒计时）、原始备份一键还原、系统 `RadioInfo` 直达、控制中心快捷磁贴与桌面图标隐藏/恢复；
+  - 内置框架激活自检、后台守护开关、双卡与 EFS 状态诊断（支持 AOSP 跨 ROM 通用 IMS 探测，兼容魅族 Flyme、小米 HyperOS 等非 ColorOS 机型，并细分无蜂窝驻网三态漫游显示）、一键热适配（含 `6s` 落盘倒计时）、原始备份一键还原、系统 `RadioInfo` 直达、控制中心快捷磁贴与桌面图标隐藏/恢复；
   - 未授予 Root 时自动降级为只读状态监控模式，绝不越权或强行提权。
 
 ---
@@ -54,11 +54,12 @@ flowchart TB
 | 层级 | 组件 / 目标路径 | 具体作用 |
 | :--- | :--- | :--- |
 | **Layer 1** | `root-module/system.prop` | 注入 `persist.dbg.ims_volte_enable=1`、`volte_avail_ovr=1`、`vt_avail_ovr=1`、`wfc_avail_ovr=1`。 |
-| **Layer 2** | `CarrierConfigHook` | 在 `OplusCarrierConfigLoader` / `CarrierConfigLoader`、`CarrierConfigManager` 及 `ImsManager` 中开启 `editable_wfc_*`、去 Entitlement 校验、强制 `WIFI_PREFERRED (2)` 与 `EPDG_ADDRESS_PLMN (1)`、ColorOS 显示键及 `wfc_carrier_name_override_by_pnn_bool`，并在 `IccRecords` 与 `CarrierDisplayNameResolver` 注入归属运营商名称防空兜底。 |
+| **Layer 2** | `CarrierConfigHook` | 在 `OplusCarrierConfigLoader` / `CarrierConfigLoader`、`CarrierConfigManager` 及 `ImsManager` 中开启 `editable_wfc_*`、去 Entitlement 校验、强制 `WIFI_PREFERRED (2)`、`EPDG_ADDRESS_PLMN (1)` 与 `{0, 1}` 地址优先级、ColorOS 显示键及 `wfc_carrier_name_override_by_pnn_bool`，并在 `IccRecords` 与 `CarrierDisplayNameResolver` 注入归属运营商名称防空兜底。 |
 | **Layer 2** | `LocationGeoHook` / `CountrySpoofer` | 为启用了 VoWiFi 伪装的卡槽统一覆盖 `TelephonyManager`、`LocaleTracker`（保护 `NITZ` 自动时区）、`CountryDetector`、高通 `ImsSenderRxr`/`ImsServiceSub` Geolocation 及 `com.qualcomm.qti.cne` 国家码，返回卡归属国家 ISO。 |
 | **Layer 3** | `/efsprofiles/overideconfig` (`_Subscription01`) | `vowifix-efs` 仅合并 `[ILS:IlsGeoLocImsWlan]` 4 项优先级/国家码覆盖键与 `[SIPConfig:GeoLocation]` `iEnableCellInfoInPANI=0`、`[SIPConfig:FeatureFlags]` `IsCNIEnabled=0`。 |
 | **Layer 3** | `/nv/item_files/ims/qp_ims_service_enablement_config` | `vowifix-efs` 在不改变 `1024 B` 结构的前提下仅做最小 3 字节解锁：`0x08 != 0x01 -> 0x01`（总开关）、`0x09 ∈ {0x00,0x03,0x04} -> 0x01`（Wi-Fi 优先）、`0x0D == 0x02 -> 0x01`（解除漫游封锁）。 |
-| **Layer 4** | `service.sh` / `MainActivity` | 尊重用户意图（仅当 `wfc_ims_enabled != 0` 且模式为 `1`/`-1` 时校准 `siminfo` 为 `2`），并通过 `QRTR` 触发 `QMI_VS` `0x008e` 免重启重载。 |
+| **Layer 3** | `/data/iwlan_s2b_config.xml` (`_Subscription01`) | `vowifix-efs` 采用 XML 注释感知匹配，仅对原厂已配置静态 `<fqdn>` 但关闭开关的槽位将 `<static_fqdn_enabled>FALSE</static_fqdn_enabled>` 改为 `TRUE`，无静态 `<fqdn>` 的槽位自动跳过。 |
+| **Layer 4** | `service.sh` / `MainActivity` | 尊重用户意图（仅当 `wfc_ims_enabled != 0` 且模式为 `1`/`-1` 时校准 `siminfo` 为 `2`），通过 `QRTR` 触发 `QMI_VS` `0x008e` 免重启重载，并提供跨 ROM 通用 IMS 探测与无蜂窝三态漫游显示。 |
 
 ---
 
@@ -76,10 +77,10 @@ flowchart TB
 ### 1. 安装模块与插件
 
 1. 从 Releases 下载（或自行构建）：
-   - `VoWiFiX-v1.0.4.zip`（Root 模块，模块 ID：`vowifix`）
-   - `VoWiFiX-LSPosed-v1.0.4.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
-2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.4.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
-3. 安装 `VoWiFiX-LSPosed-v1.0.4.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
+   - `VoWiFiX-v1.0.5.zip`（Root 模块，模块 ID：`vowifix`）
+   - `VoWiFiX-LSPosed-v1.0.5.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
+2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.5.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
+3. 安装 `VoWiFiX-LSPosed-v1.0.5.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
    - `android` / `system`（系统框架）
    - `com.android.phone`（电话服务）
    - `com.android.settings`（系统设置）
