@@ -1,6 +1,9 @@
 package io.iniwex.vowifix;
 
 import android.os.PersistableBundle;
+import android.text.TextUtils;
+
+import java.util.List;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
@@ -22,6 +25,9 @@ public final class CarrierConfigHook {
         hookCarrierConfigLoader(lpparam);
         hookCarrierConfigManager(lpparam);
         hookImsManagers(lpparam);
+        if ("com.android.phone".equals(lpparam.packageName)) {
+            hookWfcCarrierNameFallback(lpparam);
+        }
     }
 
     /**
@@ -66,6 +72,9 @@ public final class CarrierConfigHook {
         bundle.putInt("volte_status", 1);
         bundle.putInt("vowifi_preferred_mode", 2);
         bundle.putInt("vowifi_roaming_preferred_mode", 2);
+
+        // VoWiFi 激活且 SIM 无 EF_SPN 时优先采用归属 EF_PNN 名称，避免漫游时显示基站名称
+        bundle.putBoolean("wfc_carrier_name_override_by_pnn_bool", true);
     }
 
     private static void hookCarrierConfigLoader(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -218,6 +227,146 @@ public final class CarrierConfigHook {
                 }
             });
             XposedBridge.log(TAG + "Hooked com.android.ims.ImsManagerExtImpl in " + lpparam.packageName);
+        }
+    }
+
+    /**
+     * 判断指定卡槽当前是否处于 VoWiFi 或跨卡呼叫（Cross-SIM Calling）注册激活状态。
+     */
+    private static boolean isWfcOrCrossSimActive(int phoneId, ClassLoader cl) {
+        if (phoneId < 0) {
+            return false;
+        }
+        String prop = CountrySpoofer.getSystemProperty("gsm.ims.type" + phoneId, "").trim();
+        if ("vowifi".equalsIgnoreCase(prop)) {
+            return true;
+        }
+        try {
+            Class<?> pf = XposedHelpers.findClassIfExists("com.android.internal.telephony.PhoneFactory", cl);
+            if (pf == null) {
+                return false;
+            }
+            Object phone = XposedHelpers.callStaticMethod(pf, "getPhone", phoneId);
+            if (phone == null) {
+                return false;
+            }
+            if (!Boolean.TRUE.equals(XposedHelpers.callMethod(phone, "isImsRegistered"))) {
+                return false;
+            }
+            try {
+                if (Boolean.TRUE.equals(XposedHelpers.callMethod(phone, "isWifiCallingEnabled"))) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+            Object imsPhone = XposedHelpers.callMethod(phone, "getImsPhone");
+            if (imsPhone != null) {
+                try {
+                    if (Boolean.TRUE.equals(XposedHelpers.callMethod(imsPhone, "isWifiCallingEnabled"))) {
+                        return true;
+                    }
+                } catch (Throwable ignored) {
+                }
+                Object tech = XposedHelpers.callMethod(imsPhone, "getImsRegistrationTech");
+                return tech instanceof Number && ((Number) tech).intValue() == 2;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * 为无 EF_SPN 且 EF_PNN 也为空的冷门 SIM 卡提供 VoWiFi 归属运营商名称防空兜底。
+     */
+    private static void hookWfcCarrierNameFallback(XC_LoadPackage.LoadPackageParam lpparam) {
+        // 兜底 A：Legacy ServiceStateTracker 路径防 getPnnHomeName() 返回空导致拼出 "null VoWifi"
+        Class<?> iccRecords = XposedHelpers.findClassIfExists(
+                "com.android.internal.telephony.uicc.IccRecords", lpparam.classLoader);
+        if (iccRecords != null) {
+            XposedHelpers.findAndHookMethod(iccRecords, "getPnnHomeName", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object res = param.getResult();
+                    if (res instanceof CharSequence && !TextUtils.isEmpty((CharSequence) res)) {
+                        return;
+                    }
+                    try {
+                        Object parentApp = XposedHelpers.getObjectField(param.thisObject, "mParentApp");
+                        if (parentApp == null) {
+                            return;
+                        }
+                        int phoneId = (int) XposedHelpers.callMethod(parentApp, "getPhoneId");
+                        if (CountrySpoofer.shouldSpoofSlot(phoneId)
+                                && isWfcOrCrossSimActive(phoneId, lpparam.classLoader)) {
+                            String fallback = CountrySpoofer.getHomeOperatorNameForSlot(phoneId);
+                            if (!TextUtils.isEmpty(fallback)) {
+                                param.setResult(fallback);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "Hooked IccRecords.getPnnHomeName");
+        }
+
+        // 兜底 B：新架构 CarrierDisplayNameResolver 路径在 EF_SPN/EF_PNN 均为空时用归属名替换 PLMN 基站名
+        Class<?> cdnrClass = XposedHelpers.findClassIfExists(
+                "com.android.internal.telephony.cdnr.CarrierDisplayNameResolver", lpparam.classLoader);
+        final Class<?> builderClass = XposedHelpers.findClassIfExists(
+                "com.android.internal.telephony.cdnr.CarrierDisplayNameData$Builder", lpparam.classLoader);
+        if (cdnrClass != null && builderClass != null) {
+            XC_MethodHook cdnrHook = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args == null || param.args.length == 0 || param.args[0] == null) {
+                        return;
+                    }
+                    try {
+                        Object data = param.args[0];
+                        Object spnObj = XposedHelpers.callMethod(data, "getSpn");
+                        CharSequence spn = spnObj instanceof CharSequence ? (CharSequence) spnObj : null;
+                        if (!TextUtils.isEmpty(spn)) {
+                            return;
+                        }
+                        Object efPnn = XposedHelpers.callMethod(param.thisObject, "getEfPnn");
+                        if (efPnn instanceof List && !((List<?>) efPnn).isEmpty()) {
+                            return;
+                        }
+                        Object phone = XposedHelpers.getObjectField(param.thisObject, "mPhone");
+                        if (phone == null) {
+                            return;
+                        }
+                        int phoneId = (int) XposedHelpers.callMethod(phone, "getPhoneId");
+                        if (!CountrySpoofer.shouldSpoofSlot(phoneId)) {
+                            return;
+                        }
+                        String homeName = CountrySpoofer.getHomeOperatorNameForSlot(phoneId);
+                        if (TextUtils.isEmpty(homeName)) {
+                            return;
+                        }
+                        Object dataSpnObj = XposedHelpers.callMethod(data, "getDataSpn");
+                        String dataSpn = dataSpnObj instanceof String ? (String) dataSpnObj : null;
+                        boolean showSpn = Boolean.TRUE.equals(XposedHelpers.callMethod(data, "shouldShowSpn"));
+                        boolean showPlmn = Boolean.TRUE.equals(XposedHelpers.callMethod(data, "shouldShowPlmn"));
+                        Object builder = XposedHelpers.newInstance(builderClass);
+                        if (spn != null) {
+                            XposedHelpers.callMethod(builder, "setSpn", spn.toString());
+                        }
+                        if (dataSpn != null) {
+                            XposedHelpers.callMethod(builder, "setDataSpn", dataSpn);
+                        }
+                        XposedHelpers.callMethod(builder, "setShowSpn", showSpn);
+                        XposedHelpers.callMethod(builder, "setPlmn", homeName);
+                        XposedHelpers.callMethod(builder, "setShowPlmn", showPlmn);
+                        param.args[0] = XposedHelpers.callMethod(builder, "build");
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            XposedBridge.hookAllMethods(cdnrClass, "getCarrierDisplayNameFromWifiCallingOverride", cdnrHook);
+            XposedBridge.hookAllMethods(cdnrClass, "getCarrierDisplayNameFromCrossSimCallingOverride", cdnrHook);
+            XposedBridge.log(TAG + "Hooked CarrierDisplayNameResolver WFC/CrossSIM override");
         }
     }
 }

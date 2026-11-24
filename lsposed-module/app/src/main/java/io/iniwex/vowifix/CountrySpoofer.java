@@ -215,6 +215,18 @@ public final class CountrySpoofer {
     }
 
     /**
+     * 获取指定卡槽 SIM 卡声明的归属运营商名称（依次回退 gsm.sim.operator.alpha 与 numeric）。
+     */
+    public static String getHomeOperatorNameForSlot(int slotIndex) {
+        String alpha = getSlotPropPart("gsm.sim.operator.alpha", slotIndex);
+        if (!TextUtils.isEmpty(alpha)) {
+            return alpha;
+        }
+        String numeric = getSlotPropPart("gsm.sim.operator.numeric", slotIndex);
+        return !TextUtils.isEmpty(numeric) ? numeric : null;
+    }
+
+    /**
      * 判断指定卡槽是否处于“SIM 归属 MCC 与当前蜂窝驻网 MCC 不匹配”（跨国漫游）状态。
      */
     public static boolean isSlotRoamingMismatch(int slotIndex) {
