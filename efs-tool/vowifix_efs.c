@@ -23,6 +23,7 @@
 #define CALLBACK_MODE 6
 #define NO_LOGGING_MODE 7
 #define USER_SPACE_DATA_TYPE 0x20
+#define DIAG_REMOTE_MDM1_BIT 0x0001U
 
 /* GKI 用户态 diag-router UNIX SEQPACKET 控制信令字 */
 #define DIAG_ROUTER_CMD_REMOTE_DEV 0x33U
@@ -234,6 +235,20 @@ static int match_response(const uint8_t *cmd, int cmd_len, const uint8_t *rsp, i
     return 1;
 }
 
+/* 根据命令行模式选项与远端掩码判断是否启用外挂基带 MDM1：
+ * 仅 bit0 (0x0001) 代表外挂主基带 MDM1；0x0002 等第二协处理器位不得误判为外挂基带。 */
+static int diag_resolve_is_remote(diag_mode_opt_t mode_opt, uint16_t remote_mask) {
+    if (mode_opt == DIAG_MODE_REMOTE) return 1;
+    if (mode_opt == DIAG_MODE_LOCAL) return 0;
+    return (remote_mask & DIAG_REMOTE_MDM1_BIT) ? 1 : 0;
+}
+
+/* 计算 SWITCH_LOGGING 的 pd_val：仅激活内置 MPSS (1u) 或再叠加外挂 MDM1 (3u)，
+ * 绝不混入 0x0002 等无关远端掩码位。 */
+static uint32_t diag_compute_pd_val(int is_remote) {
+    return is_remote ? (1u | (DIAG_REMOTE_MDM1_BIT << 1)) : 1u;
+}
+
 /* 无副作用轻量探测 /dev/diag 字符设备是否存在（不切换 logging mode） */
 static int diagchar_detect(void) {
     struct stat st;
@@ -259,15 +274,7 @@ static int diagchar_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
         remote_mask = 0;
     }
     ctx->remote_mask = remote_mask;
-
-    if (mode_opt == DIAG_MODE_REMOTE) {
-        ctx->is_remote = 1;
-        if (remote_mask == 0) remote_mask = 1;
-    } else if (mode_opt == DIAG_MODE_LOCAL) {
-        ctx->is_remote = 0;
-    } else {
-        ctx->is_remote = (remote_mask != 0) ? 1 : 0;
-    }
+    ctx->is_remote = diag_resolve_is_remote(mode_opt, remote_mask);
     ctx->token = ctx->is_remote ? -1 : 0;
 
     int client_id = 0;
@@ -280,7 +287,7 @@ static int diagchar_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
     mode.pd_mask = 0;
     mode.mode_param = 1;
     mode.diag_id = -22;
-    mode.pd_val = ctx->is_remote ? (1u | (((uint32_t)remote_mask) << 1)) : 1u;
+    mode.pd_val = diag_compute_pd_val(ctx->is_remote);
 
     if (ioctl(ctx->fd, DIAG_IOCTL_SWITCH_LOGGING, &mode) < 0) {
         fprintf(stderr, "ioctl(DIAG_IOCTL_SWITCH_LOGGING) failed: errno=%d (%s)\n", errno, strerror(errno));
@@ -380,8 +387,7 @@ static int diagchar_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_
 
 /* 构造 diag-router 的 DIAG_IOCTL_SWITCH_LOGGING (data_type=7) 32 字节请求帧（末尾含 4B PID） */
 static void diag_router_build_switch_logging_req(uint32_t req_mode, int is_remote,
-                                                 uint16_t remote_mask, int32_t pid,
-                                                 uint8_t out[32]) {
+                                                 int32_t pid, uint8_t out[32]) {
     memset(out, 0, 32);
     uint32_t dt = DIAG_IOCTL_SWITCH_LOGGING;
     struct diag_logging_mode_param_t mode;
@@ -391,7 +397,7 @@ static void diag_router_build_switch_logging_req(uint32_t req_mode, int is_remot
     mode.pd_mask = 0;
     mode.mode_param = 1;
     mode.diag_id = -22;
-    mode.pd_val = is_remote ? (1u | (((uint32_t)remote_mask) << 1)) : 1u;
+    mode.pd_val = diag_compute_pd_val(is_remote);
 
     int32_t eff_pid = (pid >= 1) ? pid : 1;
     memcpy(out, &dt, 4);
@@ -602,21 +608,12 @@ static int diag_router_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
         }
     }
     ctx->remote_mask = remote_mask;
-
-    if (mode_opt == DIAG_MODE_REMOTE) {
-        ctx->is_remote = 1;
-        if (remote_mask == 0) remote_mask = 1;
-    } else if (mode_opt == DIAG_MODE_LOCAL) {
-        ctx->is_remote = 0;
-    } else {
-        ctx->is_remote = (remote_mask != 0) ? 1 : 0;
-    }
+    ctx->is_remote = diag_resolve_is_remote(mode_opt, remote_mask);
     ctx->token = ctx->is_remote ? -1 : 0;
 
     uint8_t sw_req[32];
     int32_t self_pid = (int32_t)getpid();
-    diag_router_build_switch_logging_req(CALLBACK_MODE, ctx->is_remote, remote_mask,
-                                         self_pid, sw_req);
+    diag_router_build_switch_logging_req(CALLBACK_MODE, ctx->is_remote, self_pid, sw_req);
     if (write(ctx->fd, sw_req, sizeof(sw_req)) != (ssize_t)sizeof(sw_req)) {
         fprintf(stderr, "diag-router write(switch_logging) failed: errno=%d (%s)\n",
                 errno, strerror(errno));
@@ -678,17 +675,11 @@ static int diag_router_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int c
     return -1;
 }
 
+/* 关闭 diag-router 套接字：直接 close() 触发对端 Empty read (EOF)，
+ * 由 diag_close_logging_process() 自动清理本 PID 会话并恢复 USB_MODE (0)；
+ * 不可主动发送 NO_LOGGING_MODE，否则会提前清空 PID 并使全局 curr_mode 滞留为 4。 */
 static void diag_router_close(diag_ctx_t *ctx) {
     if (ctx && ctx->fd >= 0) {
-        uint8_t sw_req[32];
-        uint8_t rsp[32];
-        uint16_t rmask = (ctx->is_remote && ctx->remote_mask == 0) ? 1 : ctx->remote_mask;
-        diag_router_build_switch_logging_req(NO_LOGGING_MODE, ctx->is_remote, rmask,
-                                             (int32_t)getpid(), sw_req);
-        if (write(ctx->fd, sw_req, sizeof(sw_req)) == (ssize_t)sizeof(sw_req)) {
-            (void)diag_router_recv_ctrl(ctx->fd, DIAG_ROUTER_RSP_SWITCH_LOGGING,
-                                        rsp, 8, sizeof(rsp), 100);
-        }
         close(ctx->fd);
         ctx->fd = -1;
     }
@@ -2105,7 +2096,7 @@ static int run_self_tests(void) {
 
     /* 用例 9：GKI diag-router 协议封包/解包（32B switch_logging、无 token 12B 内置头 vs 16B 外挂头）校验 */
     uint8_t sw_local[32], sw_remote[32];
-    diag_router_build_switch_logging_req(CALLBACK_MODE, 0, 0, 12345, sw_local);
+    diag_router_build_switch_logging_req(CALLBACK_MODE, 0, 12345, sw_local);
     uint32_t sw_dt = 0, sw_reqm = 0, sw_pmask = 0, sw_pdv = 0;
     int32_t sw_id = 0, sw_pid = 0;
     memcpy(&sw_dt, sw_local, 4);
@@ -2118,11 +2109,11 @@ static int run_self_tests(void) {
         sw_pmask != 0xFFFU || sw_id != -22 || sw_pdv != 1u || sw_pid != 12345) {
         fprintf(stderr, "FAIL T9 switch_logging local encode\n"); return 1;
     }
-    diag_router_build_switch_logging_req(NO_LOGGING_MODE, 1, 0x03, 0, sw_remote);
+    diag_router_build_switch_logging_req(CALLBACK_MODE, 1, 0, sw_remote);
     memcpy(&sw_reqm, sw_remote + 4, 4);
     memcpy(&sw_pdv, sw_remote + 24, 4);
     memcpy(&sw_pid, sw_remote + 28, 4);
-    if (sw_reqm != NO_LOGGING_MODE || sw_pdv != 7u || sw_pid != 1) {
+    if (sw_reqm != CALLBACK_MODE || sw_pdv != 3u || sw_pid != 1) {
         fprintf(stderr, "FAIL T9 switch_logging remote & pid guard\n"); return 1;
     }
 
@@ -2190,7 +2181,47 @@ static int run_self_tests(void) {
         fprintf(stderr, "FAIL T9 remote 16B rx parse\n"); return 1;
     }
 
-    printf("SELF-TEST PASSED: all 9 INI/SE merge, diag-router/diagchar transport & QMI refresh cases OK\n");
+    /* 用例 10：remote_mask 掩码判定、pd_val 隔离与 diag_router_close 纯 EOF 回归校验 */
+    if (diag_resolve_is_remote(DIAG_MODE_AUTO, 0x0000U) != 0 ||
+        diag_resolve_is_remote(DIAG_MODE_AUTO, 0x0002U) != 0 ||
+        diag_resolve_is_remote(DIAG_MODE_AUTO, 0x8000U) != 0 ||
+        diag_resolve_is_remote(DIAG_MODE_AUTO, 0x0001U) != 1 ||
+        diag_resolve_is_remote(DIAG_MODE_AUTO, 0x0003U) != 1 ||
+        diag_resolve_is_remote(DIAG_MODE_LOCAL, 0x0001U) != 0 ||
+        diag_resolve_is_remote(DIAG_MODE_LOCAL, 0x0003U) != 0 ||
+        diag_resolve_is_remote(DIAG_MODE_REMOTE, 0x0000U) != 1 ||
+        diag_resolve_is_remote(DIAG_MODE_REMOTE, 0x0002U) != 1) {
+        fprintf(stderr, "FAIL T10 remote_mask resolution\n"); return 1;
+    }
+    if (diag_compute_pd_val(0) != 1u || diag_compute_pd_val(1) != 3u) {
+        fprintf(stderr, "FAIL T10 pd_val compute\n"); return 1;
+    }
+    int sv[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        fprintf(stderr, "FAIL T10 socketpair setup\n"); return 1;
+    }
+    diag_ctx_t close_ctx;
+    memset(&close_ctx, 0, sizeof(close_ctx));
+    close_ctx.fd = sv[0];
+    close_ctx.remote_mask = 0x0002U;
+    close_ctx.is_remote = 0;
+    close_ctx.ops = &DIAG_ROUTER_OPS;
+    diag_router_close(&close_ctx);
+    if (close_ctx.fd != -1) {
+        close(sv[1]);
+        fprintf(stderr, "FAIL T10 close fd reset\n"); return 1;
+    }
+    struct pollfd pfd = { .fd = sv[1], .events = POLLIN };
+    uint8_t probe_buf[64];
+    ssize_t probe_n = -1;
+    if (poll(&pfd, 1, 500) <= 0 ||
+        (probe_n = read(sv[1], probe_buf, sizeof(probe_buf))) != 0) {
+        close(sv[1]);
+        fprintf(stderr, "FAIL T10 expected pure EOF on close (got %zd)\n", probe_n); return 1;
+    }
+    close(sv[1]);
+
+    printf("SELF-TEST PASSED: all 10 INI/SE merge, diag-router/diagchar transport & QMI refresh cases OK\n");
     return 0;
 }
 
@@ -2215,6 +2246,111 @@ static int select_slots(const char *target, const slot_target_t **out_list, size
     return -1;
 }
 
+/* 对单槽 overideconfig 执行备份、合并与写回校验：
+ * 返回 0 表示成功（已补丁或无需更改），1 表示目标不存在（跳过该槽 SE 检查），-1 表示读写失败。 */
+static int patch_one_ini_target(const diag_ctx_t *ctx, const slot_target_t *slot,
+                                const char *backup_dir, const ini_patch_entry_t *entries,
+                                size_t nentries, int *changed) {
+    uint8_t *orig = NULL;
+    size_t orig_len = 0;
+    int rr = efs_read_all_mem(ctx, slot->efs_path, &orig, &orig_len);
+    if (rr == -2) {
+        printf("%s (%s): SKIP (not found)\n", slot->slot_name, slot->efs_path);
+        return 1;
+    }
+    if (rr != 0) {
+        fprintf(stderr, "%s (%s): READ_ERROR\n", slot->slot_name, slot->efs_path);
+        return -1;
+    }
+
+    if (ini_check_patched(orig, orig_len, entries, nentries)) {
+        printf("%s (%s): ALREADY_PATCHED (size=%zu)\n",
+               slot->slot_name, slot->efs_path, orig_len);
+        free(orig);
+        return 0;
+    }
+
+    if (backup_original_if_needed(backup_dir, slot->slot_name, orig, orig_len) != 0) {
+        free(orig);
+        return -1;
+    }
+
+    uint8_t *merged = NULL;
+    size_t merged_len = 0;
+    if (ini_merge(orig, orig_len, entries, nentries, &merged, &merged_len) != 0) {
+        fprintf(stderr, "%s: ini_merge failed\n", slot->slot_name);
+        free(orig);
+        return -1;
+    }
+    free(orig);
+
+    if (efs_write_and_verify(ctx, slot->efs_path, merged, merged_len) != 0) {
+        free(merged);
+        return -1;
+    }
+    printf("PATCHED %s -> %zu bytes\n", slot->efs_path, merged_len);
+    free(merged);
+    (*changed)++;
+    return 0;
+}
+
+/* 对单槽 qp_ims_service_enablement_config 执行漫游与优选字节解锁：返回 0 成功/跳过，-1 失败。 */
+static int patch_one_se_target(const diag_ctx_t *ctx, const slot_target_t *slot,
+                               const char *backup_dir, int *changed) {
+    uint8_t *se_orig = NULL;
+    size_t se_len = 0;
+    int sr = efs_read_all_mem(ctx, slot->se_path, &se_orig, &se_len);
+    if (sr == -2) {
+        printf("%s (%s): SKIP (not found)\n", slot->se_backup_prefix, slot->se_path);
+        return 0;
+    }
+    if (sr != 0) {
+        fprintf(stderr, "%s (%s): READ_ERROR\n", slot->se_backup_prefix, slot->se_path);
+        return -1;
+    }
+    if (se_len < 16) {
+        printf("%s (%s): SKIP (len=%zu < 16)\n",
+               slot->se_backup_prefix, slot->se_path, se_len);
+        free(se_orig);
+        return 0;
+    }
+
+    if (!se_needs_patch(se_orig, se_len)) {
+        printf("%s (%s): ALREADY_PATCHED (wfc=0x%02x pref=0x%02x roam=0x%02x)\n",
+               slot->se_backup_prefix, slot->se_path,
+               se_orig[8], se_orig[9], se_orig[13]);
+        free(se_orig);
+        return 0;
+    }
+
+    if (backup_original_if_needed(backup_dir, slot->se_backup_prefix, se_orig, se_len) != 0) {
+        free(se_orig);
+        return -1;
+    }
+
+    uint8_t *se_mod = (uint8_t *)malloc(se_len);
+    if (!se_mod) {
+        free(se_orig);
+        return -1;
+    }
+    memcpy(se_mod, se_orig, se_len);
+    free(se_orig);
+
+    if (se_apply_patch(se_mod, se_len) < 0) {
+        free(se_mod);
+        return -1;
+    }
+    if (efs_write_and_verify(ctx, slot->se_path, se_mod, se_len) != 0) {
+        free(se_mod);
+        return -1;
+    }
+    printf("PATCHED %s -> %zu bytes (wfc=0x%02x pref=0x%02x roam=0x%02x)\n",
+           slot->se_path, se_len, se_mod[8], se_mod[9], se_mod[13]);
+    free(se_mod);
+    (*changed)++;
+    return 0;
+}
+
 /* 按备份前缀从本地还原单个 EFS 目标文件，成功写入返回 0，失败返回 -1 */
 static int restore_one_target(const diag_ctx_t *ctx, const char *backup_dir,
                               const char *bak_prefix, const char *efs_path, int *changed) {
@@ -2227,10 +2363,16 @@ static int restore_one_target(const diag_ctx_t *ctx, const char *backup_dir,
         return 0;
     }
     uint32_t m = 0, sz = 0;
-    if (efs_stat(ctx, efs_path, &m, &sz) == -2) {
+    int sr = efs_stat(ctx, efs_path, &m, &sz);
+    if (sr == -2) {
         printf("%s (%s): SKIP restore (target not found in EFS)\n", bak_prefix, efs_path);
         free(bak);
         return 0;
+    }
+    if (sr != 0) {
+        fprintf(stderr, "%s (%s): STAT_ERROR during restore\n", bak_prefix, efs_path);
+        free(bak);
+        return -1;
     }
     if (efs_write_and_verify(ctx, efs_path, bak, bak_len) != 0) {
         free(bak);
@@ -2431,110 +2573,22 @@ int main(int argc, char **argv) {
 
         int changed = 0;
         for (size_t i = 0; i < scnt; i++) {
-            uint8_t *orig = NULL;
-            size_t orig_len = 0;
-            int rr = efs_read_all_mem(&ctx, slots[i].efs_path, &orig, &orig_len);
-            if (rr == -2) {
-                printf("%s (%s): SKIP (not found)\n", slots[i].slot_name, slots[i].efs_path);
-                continue;
-            } else if (rr != 0) {
-                fprintf(stderr, "%s (%s): READ_ERROR\n", slots[i].slot_name, slots[i].efs_path);
+            int ini_res = patch_one_ini_target(&ctx, &slots[i], backup_dir,
+                                               entries, nentries, &changed);
+            if (ini_res < 0) {
                 rc = 1;
-                goto out;
             }
-
-            if (ini_check_patched(orig, orig_len, entries, nentries)) {
-                printf("%s (%s): ALREADY_PATCHED (size=%zu)\n",
-                       slots[i].slot_name, slots[i].efs_path, orig_len);
-                free(orig);
-            } else {
-                if (backup_original_if_needed(backup_dir, slots[i].slot_name, orig, orig_len) != 0) {
-                    free(orig);
-                    rc = 1;
-                    goto out;
-                }
-
-                uint8_t *merged = NULL;
-                size_t merged_len = 0;
-                if (ini_merge(orig, orig_len, entries, nentries, &merged, &merged_len) != 0) {
-                    fprintf(stderr, "%s: ini_merge failed\n", slots[i].slot_name);
-                    free(orig);
-                    rc = 1;
-                    goto out;
-                }
-                free(orig);
-
-                if (efs_write_and_verify(&ctx, slots[i].efs_path, merged, merged_len) != 0) {
-                    free(merged);
-                    rc = 1;
-                    goto out;
-                }
-                printf("PATCHED %s -> %zu bytes\n", slots[i].efs_path, merged_len);
-                free(merged);
-                changed++;
-            }
-
-            /* 对活跃卡槽检查并解锁 qp_ims_service_enablement_config 漫游开关与默认 Wi-Fi 偏好 */
-            uint8_t *se_orig = NULL;
-            size_t se_len = 0;
-            int sr = efs_read_all_mem(&ctx, slots[i].se_path, &se_orig, &se_len);
-            if (sr == -2) {
-                printf("%s (%s): SKIP (not found)\n", slots[i].se_backup_prefix, slots[i].se_path);
-                continue;
-            } else if (sr != 0) {
-                fprintf(stderr, "%s (%s): READ_ERROR\n", slots[i].se_backup_prefix, slots[i].se_path);
-                rc = 1;
-                goto out;
-            } else if (se_len < 16) {
-                printf("%s (%s): SKIP (len=%zu < 16)\n",
-                       slots[i].se_backup_prefix, slots[i].se_path, se_len);
-                free(se_orig);
+            if (ini_res == 1) {
                 continue;
             }
-
-            if (!se_needs_patch(se_orig, se_len)) {
-                printf("%s (%s): ALREADY_PATCHED (wfc=0x%02x pref=0x%02x roam=0x%02x)\n",
-                       slots[i].se_backup_prefix, slots[i].se_path,
-                       se_orig[8], se_orig[9], se_orig[13]);
-                free(se_orig);
-                continue;
-            }
-
-            if (backup_original_if_needed(backup_dir, slots[i].se_backup_prefix, se_orig, se_len) != 0) {
-                free(se_orig);
+            if (patch_one_se_target(&ctx, &slots[i], backup_dir, &changed) != 0) {
                 rc = 1;
-                goto out;
             }
-
-            uint8_t *se_mod = (uint8_t *)malloc(se_len);
-            if (!se_mod) {
-                free(se_orig);
-                rc = 1;
-                goto out;
-            }
-            memcpy(se_mod, se_orig, se_len);
-            free(se_orig);
-
-            if (se_apply_patch(se_mod, se_len) < 0) {
-                free(se_mod);
-                rc = 1;
-                goto out;
-            }
-            if (efs_write_and_verify(&ctx, slots[i].se_path, se_mod, se_len) != 0) {
-                free(se_mod);
-                rc = 1;
-                goto out;
-            }
-            printf("PATCHED %s -> %zu bytes (wfc=0x%02x pref=0x%02x roam=0x%02x)\n",
-                   slots[i].se_path, se_len, se_mod[8], se_mod[9], se_mod[13]);
-            free(se_mod);
-            changed++;
         }
 
         if (changed > 0) {
             if (efs_sync(&ctx) != 0) {
                 rc = 1;
-                goto out;
             }
         }
         printf("CHANGED=%d REBOOT_REQUIRED=%d\n", changed, changed > 0 ? 1 : 0);
@@ -2548,17 +2602,14 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < scnt; i++) {
             if (restore_one_target(&ctx, backup_dir, slots[i].slot_name, slots[i].efs_path, &changed) != 0) {
                 rc = 1;
-                goto out;
             }
             if (restore_one_target(&ctx, backup_dir, slots[i].se_backup_prefix, slots[i].se_path, &changed) != 0) {
                 rc = 1;
-                goto out;
             }
         }
         if (changed > 0) {
             if (efs_sync(&ctx) != 0) {
                 rc = 1;
-                goto out;
             }
         }
         printf("CHANGED=%d REBOOT_REQUIRED=%d\n", changed, changed > 0 ? 1 : 0);

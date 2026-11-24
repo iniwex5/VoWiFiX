@@ -19,3 +19,4 @@ keystore.properties
 # 脚本生成的编译产物与临时二进制
 root-module/system/
 dist/
+docs/
