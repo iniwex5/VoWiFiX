@@ -17,9 +17,12 @@ VoWiFiX 将 **Root 基带 EFS 层工具**（`vowifix-efs` + 切卡自动守护�
 - **LSPosed 全作用域解锁与按槽伪装**
   - 绕过系统/ColorOS `CarrierConfig` 开关隐藏、Entitlement/Provisioning 云端资格校验，强制 `WIFI_PREFERRED`、`EPDG_ADDRESS_PLMN` 与 `{0, 1}` 地址优先级（静态配置优先、PLMN 回退）；开启 `wfc_carrier_name_override_by_pnn_bool` 与双架构归属运营商名防空兜底，修复无 `EF_SPN` 卡在漫游 VoWiFi 下显示驻留基站名称的问题；
   - 按卡槽自适应返回 SIM 归属 ISO 国家码并拦截基站/Wi-Fi PANI/CNI/地理位置上报（同时保留真实 `NITZ` 时区判定不受干扰）。
+- **单卡禁蜂窝纯 VoWiFi（零蜂窝驻网）**
+  - 按物理卡槽独立开启「禁蜂窝纯 VoWiFi」，通过进程内非持久化手动锁定空网 PLMN `00101` 与自动选网防回退拦截实现 WWAN 零蜂窝驻网（保留完整 `3GPP/4G/5G` 基带与 VoWiFi 正常呼出能力，避免纯 3GPP2 降级引起的高通 VoWiFi 拨号拒呼）；
+  - 默认自动豁免国内 `MCC=460` 卡（不误扰用户自主选网，通话挂断后自动补同步），并在对外状态栏/信号出口净化显示空信号与无服务状态；卸载模块时由 `uninstall.sh` 自动恢复自动选网并清理残留配置。
 - **轻量原生控制台与快捷磁贴（`~100 KB`）**
   - 纯 Java 17 + Android 原生 View 零三方库实现，支持系统浅色/深色主题自适应与 Edge-to-Edge 安全区适配；
-  - 内置框架激活自检、后台守护开关、双卡与 EFS 状态诊断（支持 AOSP 跨 ROM 通用 IMS 探测，兼容魅族 Flyme、小米 HyperOS 等非 ColorOS 机型，并细分无蜂窝驻网三态漫游显示）、一键热适配（含 `6s` 落盘倒计时）、原始备份一键还原、系统 `RadioInfo` 直达、控制中心快捷磁贴与桌面图标隐藏/恢复；
+  - 内置框架激活自检、后台守护开关、每卡独立「禁蜂窝纯 VoWiFi」开关与一键恢复全部蜂窝、双卡与 EFS 状态诊断（支持 AOSP 跨 ROM 通用 IMS 探测，兼容魅族 Flyme、小米 HyperOS 等非 ColorOS 机型，并细分无蜂窝驻网三态漫游显示）、一键热适配（含 `6s` 落盘倒计时）、原始备份一键还原、系统 `RadioInfo` 直达、控制中心快捷磁贴与桌面图标隐藏/恢复；
   - 未授予 Root 时自动降级为只读状态监控模式，绝不越权或强行提权。
 
 ---
@@ -42,7 +45,7 @@ VoWiFiX 将 **Root 基带 EFS 层工具**（`vowifix-efs` + 切卡自动守护�
 ```mermaid
 flowchart TB
     L1["Layer 1: system.prop<br/>开启系统级 VoLTE / VT / VoWiFi 能力覆盖"]
-    L2["Layer 2: LSPosed 模块 (VoWiFiXEntry)<br/>CarrierConfig 动态解锁 + 按槽国家码/地理位置伪装"]
+    L2["Layer 2: LSPosed 模块 (VoWiFiXEntry)<br/>CarrierConfig 解锁 + 国家码/地理伪装 + 单卡禁蜂窝锁空网"]
     L3["Layer 3: Native Diag Tool (vowifix-efs)<br/>EFS overideconfig 6 键合并 + qp_ims_service_enablement_config 3 字节解锁"]
     L4["Layer 4: Root 守护与控制台 (service.sh / MainActivity)<br/>切卡监听 + siminfo 模式校准 + QRTR QMI_VS 0x008e 热刷新"]
 
@@ -56,10 +59,11 @@ flowchart TB
 | **Layer 1** | `root-module/system.prop` | 注入 `persist.dbg.ims_volte_enable=1`、`volte_avail_ovr=1`、`vt_avail_ovr=1`、`wfc_avail_ovr=1`。 |
 | **Layer 2** | `CarrierConfigHook` | 在 `OplusCarrierConfigLoader` / `CarrierConfigLoader`、`CarrierConfigManager` 及 `ImsManager` 中开启 `editable_wfc_*`、去 Entitlement 校验、强制 `WIFI_PREFERRED (2)`、`EPDG_ADDRESS_PLMN (1)` 与 `{0, 1}` 地址优先级、ColorOS 显示键及 `wfc_carrier_name_override_by_pnn_bool`，并在 `IccRecords` 与 `CarrierDisplayNameResolver` 注入归属运营商名称防空兜底。 |
 | **Layer 2** | `LocationGeoHook` / `CountrySpoofer` | 为启用了 VoWiFi 伪装的卡槽统一覆盖 `TelephonyManager`、`LocaleTracker`（保护 `NITZ` 自动时区）、`CountryDetector`、高通 `ImsSenderRxr`/`ImsServiceSub` Geolocation 及 `com.qualcomm.qti.cne` 国家码，返回卡归属国家 ISO。 |
+| **Layer 2** | `CellBlockHook` / `CellBlockConfig` | 为启用禁蜂窝的非豁免卡槽下发非持久化手动锁空网 `00101`、拦截系统自动选网恢复并在对外 `TelephonyRegistryManager`/`SignalStrengthController` 出口净化状态栏显示；支持 `MCC=460` 国内卡自动豁免。 |
 | **Layer 3** | `/efsprofiles/overideconfig` (`_Subscription01`) | `vowifix-efs` 仅合并 `[ILS:IlsGeoLocImsWlan]` 4 项优先级/国家码覆盖键与 `[SIPConfig:GeoLocation]` `iEnableCellInfoInPANI=0`、`[SIPConfig:FeatureFlags]` `IsCNIEnabled=0`。 |
 | **Layer 3** | `/nv/item_files/ims/qp_ims_service_enablement_config` | `vowifix-efs` 在不改变 `1024 B` 结构的前提下仅做最小 3 字节解锁：`0x08 != 0x01 -> 0x01`（总开关）、`0x09 ∈ {0x00,0x03,0x04} -> 0x01`（Wi-Fi 优先）、`0x0D == 0x02 -> 0x01`（解除漫游封锁）。 |
 | **Layer 3** | `/data/iwlan_s2b_config.xml` (`_Subscription01`) | `vowifix-efs` 采用 XML 注释感知匹配，仅对原厂已配置静态 `<fqdn>` 但关闭开关的槽位将 `<static_fqdn_enabled>FALSE</static_fqdn_enabled>` 改为 `TRUE`，无静态 `<fqdn>` 的槽位自动跳过。 |
-| **Layer 4** | `service.sh` / `MainActivity` | 尊重用户意图（仅当 `wfc_ims_enabled != 0` 且模式为 `1`/`-1` 时校准 `siminfo` 为 `2`），通过 `QRTR` 触发 `QMI_VS` `0x008e` 免重启重载，并提供跨 ROM 通用 IMS 探测与无蜂窝三态漫游显示。 |
+| **Layer 4** | `service.sh` / `uninstall.sh` / `MainActivity` | 尊重用户意图（仅当 `wfc_ims_enabled != 0` 且模式为 `1`/`-1` 时校准 `siminfo` 为 `2`），通过 `QRTR` 触发 `QMI_VS` `0x008e` 免重启重载，提供单卡禁蜂窝配置同步与卸载恢复、跨 ROM 通用 IMS 探测与无蜂窝三态漫游显示。 |
 
 ---
 
@@ -77,10 +81,10 @@ flowchart TB
 ### 1. 安装模块与插件
 
 1. 从 Releases 下载（或自行构建）：
-   - `VoWiFiX-v1.0.5.zip`（Root 模块，模块 ID：`vowifix`）
-   - `VoWiFiX-LSPosed-v1.0.5.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
-2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.5.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
-3. 安装 `VoWiFiX-LSPosed-v1.0.5.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
+   - `VoWiFiX-v1.0.6.zip`（Root 模块，模块 ID：`vowifix`）
+   - `VoWiFiX-LSPosed-v1.0.6.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
+2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.6.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
+3. 安装 `VoWiFiX-LSPosed-v1.0.6.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
    - `android` / `system`（系统框架）
    - `com.android.phone`（电话服务）
    - `com.android.settings`（系统设置）
@@ -117,7 +121,7 @@ flowchart TB
      ```sh
      /data/adb/modules/vowifix/system/bin/vowifix-efs restore all --backup-dir /data/adb/vowifix
      ```
-   - 卸载 Root 模块时只需在 Root 管理器卸载 `VoWiFiX` 并在之前执行一次备份还原即可恢复原始 EFS。
+   - 卸载 Root 模块时，`uninstall.sh` 会自动通知进程内 Hook 切回全自动选网并清理残留控制键；如需还原原始 EFS，可在卸载前在控制台点击一次备份还原。
 
 ---
 
@@ -126,12 +130,13 @@ flowchart TB
 ```text
 VoWiFiX/
 ├── efs-tool/
-│   └── vowifix_efs.c                 # 高通 Diag/EFS2 读写校验、6 键合并、3 字节解锁与 QRTR QMI 刷新源码（含 --self-test）
+│   └── vowifix_efs.c                 # 高通 Diag/EFS2 读写校验、6 键合并、3 字节解锁与 QRTR QMI 刷新/只读状态源码（含 --self-test）
 ├── root-module/                      # KernelSU / APatch / Magisk 通用三通模块模板
 │   ├── META-INF/com/google/android/  # Magisk updater-script / update-binary
 │   ├── customize.sh                  # 安装脚本：无损迁移旧备份并就地安全合并 EFS
 │   ├── module.prop                   # 模块元信息（id=vowifix）
-│   ├── service.sh                    # 单实例切卡守护（含 siminfo 校准、flock 与防抖冷却）
+│   ├── service.sh                    # 单实例切卡守护（含 siminfo 校准、禁蜂窝配置同步、flock 与防抖冷却）
+│   ├── uninstall.sh                  # 卸载脚本：自动通知恢复自动选网并清理残留配置与控制键
 │   └── system.prop                   # Layer 1 系统属性覆盖
 ├── lsposed-module/                   # 纯 Java 17 + Android 原生 View 控制台与 Xposed 工程（零三方依赖）
 │   ├── app/
@@ -144,6 +149,8 @@ VoWiFiX/
 │   │       ├── java/io/iniwex/vowifix/
 │   │       │   ├── ActivationStatus.java
 │   │       │   ├── CarrierConfigHook.java
+│   │       │   ├── CellBlockConfig.java
+│   │       │   ├── CellBlockHook.java
 │   │       │   ├── CountrySpoofer.java
 │   │       │   ├── LocationGeoHook.java
 │   │       │   ├── MainActivity.java

@@ -67,6 +67,10 @@
 #define QMI_VS_SERVICE_ID 0x00e5U
 #define QMI_VS_MSG_BIND_SUBS 0x0021U
 #define QMI_VS_MSG_REFRESH_EFS 0x008eU
+#define QMI_NAS_SERVICE_ID 0x0003U
+#define QMI_NAS_MSG_GET_SERVING_SYSTEM 0x0024U
+#define QMI_NAS_MSG_GET_SYS_SEL_PREF 0x0034U
+#define QMI_NAS_MSG_BIND_SUBS 0x00AFU
 #define QMI_SUBS_PRIMARY 0U
 #define QMI_SUBS_SECONDARY 1U
 #define QMI_HDR_FLAG_REQ 0x00U
@@ -2089,6 +2093,314 @@ static int qmi_trigger_modem_efs_refresh(refresh_slot_opt_t slot_opt, uint32_t c
     return (rc0 == 0 || rc1 == 0) ? 0 : -1;
 }
 
+/* ===================== QRTR / QMI NAS 只读蜂窝状态核验 ===================== */
+
+/* 构造 QMI_NAS_BIND_SUBSCRIPTION_REQ_MSG_V01 (0x00AF) 请求报文，兼容 4 字节与 1 字节 TLV 0x01 */
+static int qmi_build_nas_bind_subs_req(uint16_t txn_id, uint32_t subs_id, int use_u8,
+                                       uint8_t *out, size_t cap) {
+    size_t vlen = use_u8 ? 1U : 4U;
+    if (!out || cap < sizeof(struct qmi_msg_hdr) + 3U + vlen) return -1;
+    struct qmi_msg_hdr *hdr = (struct qmi_msg_hdr *)out;
+    hdr->flags = QMI_HDR_FLAG_REQ;
+    hdr->txn_id = txn_id;
+    hdr->msg_id = QMI_NAS_MSG_BIND_SUBS;
+    hdr->msg_len = (uint16_t)(3U + vlen);
+
+    uint8_t *p = out + sizeof(struct qmi_msg_hdr);
+    p[0] = 0x01;
+    p[1] = (uint8_t)(vlen & 0xFF);
+    p[2] = 0x00;
+    p[3] = (uint8_t)(subs_id & 0xFF);
+    if (!use_u8) {
+        p[4] = (uint8_t)((subs_id >> 8) & 0xFF);
+        p[5] = (uint8_t)((subs_id >> 16) & 0xFF);
+        p[6] = (uint8_t)((subs_id >> 24) & 0xFF);
+    }
+    return (int)(sizeof(struct qmi_msg_hdr) + 3U + vlen);
+}
+
+/* 解析标准 QMI TLV 0x02 (qmi_response_type_v01: 2B result + 2B error) */
+static int qmi_find_tlv(const uint8_t *buf, size_t len, uint16_t expected_msg,
+                        uint8_t target_type, const uint8_t **out_val, uint16_t *out_len) {
+    if (!buf || len < sizeof(struct qmi_msg_hdr)) return -1;
+    const struct qmi_msg_hdr *rh = (const struct qmi_msg_hdr *)buf;
+    if (rh->flags != QMI_HDR_FLAG_RESP || rh->msg_id != expected_msg) return -1;
+    if (sizeof(struct qmi_msg_hdr) + (size_t)rh->msg_len > len) return -1;
+
+    size_t off = sizeof(struct qmi_msg_hdr);
+    size_t end = off + (size_t)rh->msg_len;
+    while (off + 3 <= end) {
+        uint8_t t = buf[off];
+        uint16_t l = (uint16_t)(buf[off + 1] | ((uint16_t)buf[off + 2] << 8));
+        off += 3;
+        if (off + l > end) return -1;
+        if (t == target_type) {
+            if (out_val) *out_val = buf + off;
+            if (out_len) *out_len = l;
+            return 0;
+        }
+        off += l;
+    }
+    return -1;
+}
+
+static int qmi_parse_nas_result_tlv(const uint8_t *buf, size_t len, uint16_t expected_msg,
+                                    uint32_t *out_res, uint32_t *out_err) {
+    const uint8_t *val = NULL;
+    uint16_t vlen = 0;
+    if (qmi_find_tlv(buf, len, expected_msg, 0x02, &val, &vlen) != 0 || vlen < 4) {
+        return -1;
+    }
+    uint32_t r = (uint32_t)(val[0] | ((uint16_t)val[1] << 8));
+    uint32_t e = (uint32_t)(val[2] | ((uint16_t)val[3] << 8));
+    if (out_res) *out_res = r;
+    if (out_err) *out_err = e;
+    return 0;
+}
+
+static void format_nas_mode_pref(uint16_t mode_pref, char *out, size_t cap) {
+    static const struct {
+        uint16_t bit;
+        const char *name;
+    } BITS[] = {
+        {0x0001U, "CDMA_1X"},
+        {0x0002U, "EVDO"},
+        {0x0004U, "GSM"},
+        {0x0008U, "UMTS"},
+        {0x0010U, "LTE"},
+        {0x0020U, "TDSCDMA"},
+        {0x0040U, "NR5G"},
+    };
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    size_t pos = 0;
+    uint16_t known = 0;
+    for (size_t i = 0; i < sizeof(BITS) / sizeof(BITS[0]); i++) {
+        if (mode_pref & BITS[i].bit) {
+            known |= BITS[i].bit;
+            int n = snprintf(out + pos, cap - pos, "%s%s", pos ? "|" : "", BITS[i].name);
+            if (n > 0 && (size_t)n < cap - pos) pos += (size_t)n;
+        }
+    }
+    uint16_t extra = (uint16_t)(mode_pref & ~known);
+    if (extra != 0) {
+        int n = snprintf(out + pos, cap - pos, "%s0x%04x", pos ? "|" : "", extra);
+        if (n > 0 && (size_t)n < cap - pos) pos += (size_t)n;
+    }
+    if (pos == 0) {
+        snprintf(out, cap, "NONE");
+    }
+}
+
+static const char *nas_reg_state_desc(int st, int roam) {
+    switch (st) {
+        case 0: return "NOT_REG";
+        case 1:
+            if (roam == 0) return "REGISTERED_ROAM";
+            if (roam == 1) return "REGISTERED_HOME";
+            return "REGISTERED";
+        case 2: return "SEARCHING";
+        case 3: return "DENIED";
+        case 4: return "UNKNOWN";
+        default: return "OTHER";
+    }
+}
+
+/* 解析 QMI_NAS_GET_SYSTEM_SELECTION_PREFERENCE_RESP (0x0034) */
+static int qmi_parse_nas_sys_sel_pref_resp(const uint8_t *buf, size_t len,
+                                           uint16_t *out_mode_pref, int *out_net_sel) {
+    uint32_t res = 0xFFFFU, err = 0xFFFFU;
+    if (qmi_parse_nas_result_tlv(buf, len, QMI_NAS_MSG_GET_SYS_SEL_PREF, &res, &err) != 0) {
+        return -1;
+    }
+    if (res != 0 || err != 0) return -1;
+
+    const uint8_t *val = NULL;
+    uint16_t vlen = 0;
+    uint16_t mp = 0;
+    if (qmi_find_tlv(buf, len, QMI_NAS_MSG_GET_SYS_SEL_PREF, 0x11, &val, &vlen) == 0 && vlen >= 2) {
+        mp = (uint16_t)(val[0] | ((uint16_t)val[1] << 8));
+    }
+    int nsel = -1;
+    if (qmi_find_tlv(buf, len, QMI_NAS_MSG_GET_SYS_SEL_PREF, 0x16, &val, &vlen) == 0 && vlen >= 1) {
+        nsel = (int)val[0];
+    }
+    if (out_mode_pref) *out_mode_pref = mp;
+    if (out_net_sel) *out_net_sel = nsel;
+    return 0;
+}
+
+/* 解析 QMI_NAS_GET_SERVING_SYSTEM_RESP (0x0024)：TLV 0x01 注册态与 TLV 0x10 漫游指示 (0=ROAM,1=HOME) */
+static int qmi_parse_nas_serving_system_resp(const uint8_t *buf, size_t len,
+                                             int *out_reg_state, int *out_roam,
+                                             char *plmn_out, size_t plmn_cap) {
+    uint32_t res = 0xFFFFU, err = 0xFFFFU;
+    if (qmi_parse_nas_result_tlv(buf, len, QMI_NAS_MSG_GET_SERVING_SYSTEM, &res, &err) != 0) {
+        return -1;
+    }
+    if (res != 0 || err != 0) return -1;
+
+    const uint8_t *val = NULL;
+    uint16_t vlen = 0;
+    int reg_st = -1;
+    if (qmi_find_tlv(buf, len, QMI_NAS_MSG_GET_SERVING_SYSTEM, 0x01, &val, &vlen) == 0 && vlen >= 1) {
+        reg_st = (int)val[0];
+    }
+    int roam = -1;
+    if (qmi_find_tlv(buf, len, QMI_NAS_MSG_GET_SERVING_SYSTEM, 0x10, &val, &vlen) == 0 && vlen >= 1) {
+        roam = (int)val[0];
+    }
+    if (out_reg_state) *out_reg_state = reg_st;
+    if (out_roam) *out_roam = roam;
+    if (plmn_out && plmn_cap > 0) {
+        snprintf(plmn_out, plmn_cap, "-");
+        if (reg_st == 1 &&
+            qmi_find_tlv(buf, len, QMI_NAS_MSG_GET_SERVING_SYSTEM, 0x12, &val, &vlen) == 0 &&
+            vlen >= 4) {
+            uint16_t mcc = (uint16_t)(val[0] | ((uint16_t)val[1] << 8));
+            uint16_t mnc = (uint16_t)(val[2] | ((uint16_t)val[3] << 8));
+            if (mcc > 0 && mcc != 0xFFFFU && mnc != 0xFFFFU) {
+                snprintf(plmn_out, plmn_cap, "%u/%02u", mcc, mnc);
+            }
+        }
+    }
+    return 0;
+}
+
+/* 发送 QMI 请求并接收完整响应报文（跳过异步事件与非目标事务） */
+static int qmi_send_and_recv_msg(int fd, const struct sockaddr_qrtr_uapi *dst,
+                                 const uint8_t *req, size_t req_len,
+                                 uint16_t txn_id, uint16_t expected_msg,
+                                 uint8_t *rsp_out, size_t rsp_cap, size_t *out_len) {
+    if (sendto(fd, req, req_len, 0, (const struct sockaddr *)dst, sizeof(*dst)) < 0) {
+        return -1;
+    }
+    for (int tries = 0; tries < 10; tries++) {
+        ssize_t n = recv(fd, rsp_out, rsp_cap, 0);
+        if (n < 0) return -1;
+        if ((size_t)n < sizeof(struct qmi_msg_hdr)) continue;
+        const struct qmi_msg_hdr *rh = (const struct qmi_msg_hdr *)rsp_out;
+        if (rh->flags != QMI_HDR_FLAG_RESP || rh->txn_id != txn_id || rh->msg_id != expected_msg) {
+            continue;
+        }
+        if (sizeof(struct qmi_msg_hdr) + (size_t)rh->msg_len > (size_t)n) return -1;
+        if (out_len) *out_len = (size_t)n;
+        return 0;
+    }
+    return -1;
+}
+
+/* 纯只读查询单卡槽 QMI_NAS (0x03) 绑定、系统选择偏好与当前驻网状态 */
+static int qmi_query_single_sub_cell_status(uint32_t subs_id) {
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "socket(AF_QIPCRTR) failed: %s\n", strerror(errno));
+        return -1;
+    }
+    struct timeval tv = { .tv_sec = 4, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint32_t node = 0, port = 0;
+    if (qrtr_lookup_service(fd, QMI_NAS_SERVICE_ID, &node, &port) != 0) {
+        fprintf(stderr, "QRTR service QMI_NAS (0x%x) not online\n", QMI_NAS_SERVICE_ID);
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_qrtr_uapi dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sq_family = AF_QIPCRTR;
+    dst.sq_node = node;
+    dst.sq_port = port;
+
+    char bind_status[32] = "ERR_SEND";
+    int bind_ok = 0;
+    uint8_t req[32];
+    uint8_t rsp[2048];
+    size_t rsp_len = 0;
+
+    int blen = qmi_build_nas_bind_subs_req(1, subs_id, 0, req, sizeof(req));
+    if (blen > 0 && qmi_send_and_recv_msg(fd, &dst, req, (size_t)blen, 1,
+                                            QMI_NAS_MSG_BIND_SUBS, rsp, sizeof(rsp), &rsp_len) == 0) {
+        uint32_t bres = 0xFFFFU, berr = 0xFFFFU;
+        if (qmi_parse_nas_result_tlv(rsp, rsp_len, QMI_NAS_MSG_BIND_SUBS, &bres, &berr) == 0) {
+            if (bres == 0 && berr == 0) {
+                snprintf(bind_status, sizeof(bind_status), "OK_4B");
+                bind_ok = 1;
+            } else {
+                /* 4 字节 TLV 被基带拒绝时尝试 1 字节订阅枚举兼容探针 */
+                int blen1 = qmi_build_nas_bind_subs_req(2, subs_id, 1, req, sizeof(req));
+                if (blen1 > 0 && qmi_send_and_recv_msg(fd, &dst, req, (size_t)blen1, 2,
+                                                         QMI_NAS_MSG_BIND_SUBS, rsp, sizeof(rsp), &rsp_len) == 0) {
+                    uint32_t bres1 = 0xFFFFU, berr1 = 0xFFFFU;
+                    if (qmi_parse_nas_result_tlv(rsp, rsp_len, QMI_NAS_MSG_BIND_SUBS, &bres1, &berr1) == 0 &&
+                        bres1 == 0 && berr1 == 0) {
+                        snprintf(bind_status, sizeof(bind_status), "OK_1B");
+                        bind_ok = 1;
+                    } else {
+                        snprintf(bind_status, sizeof(bind_status), "ERR_%u", berr1);
+                    }
+                } else {
+                    snprintf(bind_status, sizeof(bind_status), "ERR_%u", berr);
+                }
+            }
+        } else {
+            snprintf(bind_status, sizeof(bind_status), "ERR_PARSE");
+        }
+    }
+
+    /* 非主卡绑定订阅失败时立即报错退出，避免静默回落读取主卡数据导致串槽误判 */
+    if (subs_id != QMI_SUBS_PRIMARY && !bind_ok) {
+        fprintf(stderr, "CELL_NAS sub=%u BIND_SUBSCRIPTION failed (%s)\n", subs_id, bind_status);
+        close(fd);
+        return -1;
+    }
+
+    struct qmi_msg_hdr h_pref = { .flags = QMI_HDR_FLAG_REQ, .txn_id = 3, .msg_id = QMI_NAS_MSG_GET_SYS_SEL_PREF, .msg_len = 0 };
+    uint16_t mode_pref = 0;
+    int net_sel = -1;
+    if (qmi_send_and_recv_msg(fd, &dst, (const uint8_t *)&h_pref, sizeof(h_pref), 3,
+                              QMI_NAS_MSG_GET_SYS_SEL_PREF, rsp, sizeof(rsp), &rsp_len) != 0 ||
+        qmi_parse_nas_sys_sel_pref_resp(rsp, rsp_len, &mode_pref, &net_sel) != 0) {
+        fprintf(stderr, "CELL_NAS sub=%u GET_SYS_SEL_PREF failed (bind=%s)\n", subs_id, bind_status);
+        close(fd);
+        return -1;
+    }
+
+    struct qmi_msg_hdr h_ss = { .flags = QMI_HDR_FLAG_REQ, .txn_id = 4, .msg_id = QMI_NAS_MSG_GET_SERVING_SYSTEM, .msg_len = 0 };
+    int reg_state = -1;
+    int roam = -1;
+    char plmn[32] = "-";
+    if (qmi_send_and_recv_msg(fd, &dst, (const uint8_t *)&h_ss, sizeof(h_ss), 4,
+                              QMI_NAS_MSG_GET_SERVING_SYSTEM, rsp, sizeof(rsp), &rsp_len) != 0 ||
+        qmi_parse_nas_serving_system_resp(rsp, rsp_len, &reg_state, &roam, plmn, sizeof(plmn)) != 0) {
+        fprintf(stderr, "CELL_NAS sub=%u GET_SERVING_SYSTEM failed (bind=%s)\n", subs_id, bind_status);
+        close(fd);
+        return -1;
+    }
+
+    char mode_str[128];
+    format_nas_mode_pref(mode_pref, mode_str, sizeof(mode_str));
+    printf("CELL_NAS sub=%u node=%u port=%u bind=%s mode_pref=0x%04x(%s) net_sel=%d reg_state=%d(%s) roam=%d plmn=%s\n",
+           subs_id, node, port, bind_status, mode_pref, mode_str, net_sel,
+           reg_state, nas_reg_state_desc(reg_state, roam), roam, plmn);
+    close(fd);
+    return 0;
+}
+
+/* 按槽位执行只读 QMI_NAS 核验 */
+static int qmi_query_cell_status(refresh_slot_opt_t slot_opt) {
+    if (slot_opt == REFRESH_SLOT_0) {
+        return qmi_query_single_sub_cell_status(QMI_SUBS_PRIMARY);
+    }
+    if (slot_opt == REFRESH_SLOT_1) {
+        return qmi_query_single_sub_cell_status(QMI_SUBS_SECONDARY);
+    }
+    int rc0 = qmi_query_single_sub_cell_status(QMI_SUBS_PRIMARY);
+    int rc1 = qmi_query_single_sub_cell_status(QMI_SUBS_SECONDARY);
+    return (rc0 == 0 && rc1 == 0) ? 0 : -1;
+}
+
 static int run_self_tests(void) {
     const ini_patch_entry_t *entries = UNIVERSAL_PATCHES;
     size_t nentries = sizeof(UNIVERSAL_PATCHES) / sizeof(UNIVERSAL_PATCHES[0]);
@@ -2504,7 +2816,68 @@ static int run_self_tests(void) {
         fprintf(stderr, "FAIL T11 xml comment ignore guard\n"); return 1;
     }
 
-    printf("SELF-TEST PASSED: all 11 INI/SE/S2B merge, diag-router/diagchar transport & QMI refresh cases OK\n");
+    /* 用例 12：QMI_NAS 只读报文构造与解析（BIND_SUBSCRIPTION / GET_SYS_SEL_PREF / GET_SERVING_SYSTEM） */
+    uint8_t nas_bind4[16], nas_bind1[16];
+    if (qmi_build_nas_bind_subs_req(7, 1, 0, nas_bind4, sizeof(nas_bind4)) != 14 ||
+        nas_bind4[7] != 0x01 || nas_bind4[8] != 0x04 || nas_bind4[10] != 0x01 ||
+        qmi_build_nas_bind_subs_req(8, 1, 1, nas_bind1, sizeof(nas_bind1)) != 11 ||
+        nas_bind1[7] != 0x01 || nas_bind1[8] != 0x01 || nas_bind1[10] != 0x01) {
+        fprintf(stderr, "FAIL T12 nas bind req build\n"); return 1;
+    }
+    const uint8_t nas_pref_sample[] = {
+        0x02, 0x03, 0x00, 0x34, 0x00, 0x10, 0x00,
+        0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x11, 0x02, 0x00, 0x58, 0x00,
+        0x16, 0x01, 0x00, 0x00
+    };
+    uint16_t mode_pref_t = 0;
+    int net_sel_t = -1;
+    char mode_str_t[64];
+    if (qmi_parse_nas_sys_sel_pref_resp(nas_pref_sample, sizeof(nas_pref_sample), &mode_pref_t, &net_sel_t) != 0 ||
+        mode_pref_t != 0x0058U || net_sel_t != 0) {
+        fprintf(stderr, "FAIL T12 nas sys_sel_pref parse\n"); return 1;
+    }
+    format_nas_mode_pref(mode_pref_t, mode_str_t, sizeof(mode_str_t));
+    if (strcmp(mode_str_t, "UMTS|LTE|NR5G") != 0) {
+        fprintf(stderr, "FAIL T12 nas mode_pref format: %s\n", mode_str_t); return 1;
+    }
+    const uint8_t nas_ss_roaming[] = {
+        0x02, 0x04, 0x00, 0x24, 0x00, 0x1c, 0x00,
+        0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x00, 0x01, 0x01, 0x01, 0x02, 0x01, 0x08,
+        0x10, 0x01, 0x00, 0x00,
+        0x12, 0x05, 0x00, 0xcc, 0x01, 0x01, 0x00, 0x00
+    };
+    int reg_st_t = -1;
+    int roam_t = -1;
+    char plmn_t[32];
+    if (qmi_parse_nas_serving_system_resp(nas_ss_roaming, sizeof(nas_ss_roaming), &reg_st_t, &roam_t, plmn_t, sizeof(plmn_t)) != 0 ||
+        reg_st_t != 1 || roam_t != 0 ||
+        strcmp(nas_reg_state_desc(reg_st_t, roam_t), "REGISTERED_ROAM") != 0 ||
+        strcmp(plmn_t, "460/01") != 0) {
+        fprintf(stderr, "FAIL T12 nas serving_system roaming: st=%d roam=%d plmn=%s\n", reg_st_t, roam_t, plmn_t); return 1;
+    }
+    uint8_t nas_ss_home[sizeof(nas_ss_roaming)];
+    memcpy(nas_ss_home, nas_ss_roaming, sizeof(nas_ss_roaming));
+    nas_ss_home[26] = 0x01; /* TLV 0x10 roaming_indicator = 1 (HOME) */
+    if (qmi_parse_nas_serving_system_resp(nas_ss_home, sizeof(nas_ss_home), &reg_st_t, &roam_t, plmn_t, sizeof(plmn_t)) != 0 ||
+        reg_st_t != 1 || roam_t != 1 ||
+        strcmp(nas_reg_state_desc(reg_st_t, roam_t), "REGISTERED_HOME") != 0) {
+        fprintf(stderr, "FAIL T12 nas serving_system home: st=%d roam=%d\n", reg_st_t, roam_t); return 1;
+    }
+    const uint8_t nas_ss_notreg[] = {
+        0x02, 0x05, 0x00, 0x24, 0x00, 0x0d, 0x00,
+        0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x03, 0x00, 0x00, 0x00, 0x00
+    };
+    if (qmi_parse_nas_serving_system_resp(nas_ss_notreg, sizeof(nas_ss_notreg), &reg_st_t, &roam_t, plmn_t, sizeof(plmn_t)) != 0 ||
+        reg_st_t != 0 || roam_t != -1 ||
+        strcmp(nas_reg_state_desc(reg_st_t, roam_t), "NOT_REG") != 0 ||
+        strcmp(plmn_t, "-") != 0) {
+        fprintf(stderr, "FAIL T12 nas serving_system not_reg: st=%d roam=%d plmn=%s\n", reg_st_t, roam_t, plmn_t); return 1;
+    }
+
+    printf("SELF-TEST PASSED: all 12 INI/SE/S2B merge, diag-router/diagchar transport & QMI VS/NAS cases OK\n");
     return 0;
 }
 
@@ -2763,7 +3136,7 @@ int main(int argc, char **argv) {
                 "Usage: %s [--ils-only] [--no-lock] [--remote|--local] "
                 "[--backend=auto|diagchar|diag-router|libdiag|none] [--backup-dir <dir>] "
                 "detect|probe|status [slot0|slot1|all]|patch [slot0|slot1|all]|restore [slot0|slot1|all]|"
-                "refresh [slot0|slot1|all] [cfg act]|stat <efs_path>|read <efs_path> <local_out>|--self-test\n",
+                "refresh [slot0|slot1|all] [cfg act]|cell-status [slot0|slot1|all]|stat <efs_path>|read <efs_path> <local_out>|--self-test\n",
                 argv[0]);
         return 2;
     }
@@ -2782,6 +3155,19 @@ int main(int argc, char **argv) {
     if (!no_lock) {
         lock_fd = acquire_diag_lock(DEFAULT_LOCK_PATH);
         if (lock_fd < 0) return 1;
+    }
+
+    /* refresh 与 cell-status 均走纯内核 QRTR 通路，严禁打开 Diag 通道 */
+    if (strcmp(cmd, "cell-status") == 0) {
+        refresh_slot_opt_t slot_opt = REFRESH_SLOT_ALL;
+        if (pos_argc >= 2 && parse_refresh_slot(pos_args[1], &slot_opt) != 0) {
+            fprintf(stderr, "Usage: %s cell-status [slot0|slot1|all]\n", argv[0]);
+            if (lock_fd >= 0) close(lock_fd);
+            return 2;
+        }
+        int crc = (qmi_query_cell_status(slot_opt) == 0) ? 0 : 1;
+        if (lock_fd >= 0) close(lock_fd);
+        return crc;
     }
 
     /* refresh 走纯内核 QRTR 通路，严禁打开 Diag 通道，避免与刚落盘或重启的基带产生并发冲突 */

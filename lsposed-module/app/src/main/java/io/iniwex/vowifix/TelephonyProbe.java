@@ -155,6 +155,40 @@ public final class TelephonyProbe {
         }
     }
 
+    public static final class CellBlockSlotStatus {
+        public boolean ruleEnabled = false;
+        public boolean exemptCnActive = false;
+        public boolean manualSelection = false;
+        public int modemRaf = 0;
+        public int currentUserRaf = -1;
+        public String wwanVoiceReg = "";
+        public String wwanDataReg = "";
+        public String wwanPlmn = "";
+
+        public CellBlockConfig.IsolationTarget getTarget() {
+            return CellBlockConfig.selectIsolationTarget(modemRaf);
+        }
+
+        /**
+         * 基于 GsmCdmaPhone 的 WWAN CS/PS 注册态及 rRplmn 判断是否已实现零蜂窝基站驻网。
+         */
+        public boolean isZeroCellularRegistered() {
+            if (wwanVoiceReg.isEmpty() && wwanDataReg.isEmpty()) {
+                return false;
+            }
+            boolean vReg = wwanVoiceReg.contains("HOME") || wwanVoiceReg.contains("ROAMING");
+            boolean dReg = wwanDataReg.contains("HOME") || wwanDataReg.contains("ROAMING");
+            return !vReg && !dReg && wwanPlmn.isEmpty();
+        }
+
+        /**
+         * 仅当同时处于手动选网态且 WWAN CS/PS 双域零驻网时，才认定空网锁定真正生效。
+         */
+        public boolean isManualZeroCellularLocked() {
+            return manualSelection && isZeroCellularRegistered();
+        }
+    }
+
     public static final class FullSnapshot {
         public boolean lsposedActive;
         public boolean hasRoot;
@@ -166,6 +200,9 @@ public final class TelephonyProbe {
         public String baseband = "";
         public SlotSnapshot[] slots = new SlotSnapshot[2];
         public EfsSlotStatus[] efs = new EfsSlotStatus[]{new EfsSlotStatus(), new EfsSlotStatus()};
+        public boolean cellExemptCn = true;
+        public CellBlockSlotStatus[] cellBlock = new CellBlockSlotStatus[]{
+                new CellBlockSlotStatus(), new CellBlockSlotStatus()};
         public String serviceLog = "";
         public String errorNote = "";
 
@@ -385,6 +422,23 @@ public final class TelephonyProbe {
                     .append(" -e ' mSS =' -e 'onImsMmTelConnected' -e 'handleImsRegistered:' || true\n")
                     .append("echo '===IMS_DUMP_END==='\n");
         }
+        // 读取单卡禁蜂窝规则、siminfo user 掩码与 GsmCdmaPhone WWAN 驻网态（绝不打开 Diag 通道）
+        metaScript.append("echo '===CELL_BEGIN==='\n")
+                .append("CB0=0; CB1=0; CEX=1\n")
+                .append("CONF='").append(CellBlockConfig.CONF_PATH).append("'\n")
+                .append("if [ -f \"$CONF\" ]; then\n")
+                .append("  SLOT0_BLOCK=$(sed -nE 's/^SLOT0_BLOCK=([01]).*/\\1/p' \"$CONF\" | head -n 1)\n")
+                .append("  SLOT1_BLOCK=$(sed -nE 's/^SLOT1_BLOCK=([01]).*/\\1/p' \"$CONF\" | head -n 1)\n")
+                .append("  EXEMPT_CN_460=$(sed -nE 's/^EXEMPT_CN_460=([01]).*/\\1/p' \"$CONF\" | head -n 1)\n")
+                .append("  CB0=\"${SLOT0_BLOCK:-0}\"; CB1=\"${SLOT1_BLOCK:-0}\"; CEX=\"${EXEMPT_CN_460:-1}\"\n")
+                .append("fi\n")
+                .append("echo \"CELL_CONF:${CB0}:${CB1}:${CEX}\"\n")
+                .append("MR0=$(settings get global ").append(CellBlockConfig.KEY_MODEM_RAF_PREFIX).append("0 2>/dev/null | tr -dc '0-9')\n")
+                .append("MR1=$(settings get global ").append(CellBlockConfig.KEY_MODEM_RAF_PREFIX).append("1 2>/dev/null | tr -dc '0-9')\n")
+                .append("echo \"CELL_MRAF:${MR0:-0}:${MR1:-0}\"\n")
+                .append("content query --uri content://telephony/siminfo --where 'sim_id>=0' --projection sim_id:allowed_network_types_for_reasons 2>/dev/null | tr -d '\\r' | grep 'sim_id=' || true\n")
+                .append("dumpsys activity service com.android.phone/.TelephonyDebugService 2>/dev/null | grep -F -e 'GsmCdmaPhone extends:' -e 'ImsPhone extends:' -e 'mPhoneId=' -e 'mPhoneId =' -e 'mSS={' -e 'mSS = {' || true\n")
+                .append("echo '===CELL_END==='\n");
 
         String imsDump = "";
         RootShell.Result mr = RootShell.execRoot(metaScript.toString(), 10);
@@ -408,6 +462,10 @@ public final class TelephonyProbe {
             } else {
                 snap.slots[i] = slot;
             }
+            snap.cellBlock[i].exemptCnActive = snap.cellBlock[i].ruleEnabled
+                    && snap.cellExemptCn
+                    && snap.slots[i].isSimLoaded()
+                    && CellBlockConfig.isChinaMainlandPlmn(snap.slots[i].simNumeric);
         }
         cacheResolvedImsTypes(snap.slots);
 
@@ -449,12 +507,15 @@ public final class TelephonyProbe {
         String[] lines = out.split("\n");
         boolean inLog = false;
         boolean inImsDump = false;
+        boolean inCellDump = false;
         StringBuilder logSb = new StringBuilder();
         StringBuilder imsSb = new StringBuilder();
+        StringBuilder cellSb = new StringBuilder();
         for (String line : lines) {
             if ("===LOG_BEGIN===".equals(line)) {
                 inLog = true;
                 inImsDump = false;
+                inCellDump = false;
                 continue;
             }
             if ("===LOG_END===".equals(line)) {
@@ -464,10 +525,21 @@ public final class TelephonyProbe {
             if ("===IMS_DUMP_BEGIN===".equals(line)) {
                 inImsDump = true;
                 inLog = false;
+                inCellDump = false;
                 continue;
             }
             if ("===IMS_DUMP_END===".equals(line)) {
                 inImsDump = false;
+                continue;
+            }
+            if ("===CELL_BEGIN===".equals(line)) {
+                inCellDump = true;
+                inLog = false;
+                inImsDump = false;
+                continue;
+            }
+            if ("===CELL_END===".equals(line)) {
+                inCellDump = false;
                 continue;
             }
             if (inLog) {
@@ -484,6 +556,13 @@ public final class TelephonyProbe {
                 imsSb.append(line);
                 continue;
             }
+            if (inCellDump) {
+                if (cellSb.length() > 0) {
+                    cellSb.append('\n');
+                }
+                cellSb.append(line);
+                continue;
+            }
             if (line.startsWith("META:")) {
                 String[] p = line.split(":");
                 if (p.length >= 5) {
@@ -498,7 +577,127 @@ public final class TelephonyProbe {
             }
         }
         snap.serviceLog = logSb.toString();
+        parseCellDump(cellSb.toString(), snap);
         return imsSb.toString();
+    }
+
+    /**
+     * 解析禁蜂窝规则配置、modemRaf、siminfo user 掩码与 GsmCdmaPhone 蜂窝注册状态。
+     */
+    static void parseCellDump(String cellDump, FullSnapshot snap) {
+        if (cellDump == null || cellDump.trim().isEmpty() || snap == null) {
+            return;
+        }
+        int curPhoneSlot = -1;
+        boolean hasGsmHeader = false;
+        boolean expectingGsmPhoneId = false;
+        boolean[] capturedSs = new boolean[]{false, false};
+        for (String rawLine : cellDump.split("\n")) {
+            String t = rawLine.trim();
+            if (t.isEmpty()) {
+                continue;
+            }
+            if (t.startsWith("CELL_CONF:")) {
+                String[] p = t.split(":", -1);
+                if (p.length >= 4) {
+                    snap.cellBlock[0].ruleEnabled = "1".equals(p[1].trim());
+                    snap.cellBlock[1].ruleEnabled = "1".equals(p[2].trim());
+                    snap.cellExemptCn = !"0".equals(p[3].trim());
+                }
+                continue;
+            }
+            if (t.startsWith("CELL_MRAF:")) {
+                String[] p = t.split(":", -1);
+                if (p.length >= 3) {
+                    snap.cellBlock[0].modemRaf = parseIntSafe(p[1], 0);
+                    snap.cellBlock[1].modemRaf = parseIntSafe(p[2], 0);
+                }
+                continue;
+            }
+            if (t.contains("sim_id=")) {
+                Matcher mSim = Pattern.compile("sim_id=(\\d+)").matcher(t);
+                if (mSim.find()) {
+                    int sid = parseIntSafe(mSim.group(1), -1);
+                    if (sid == 0 || sid == 1) {
+                        int idx = t.indexOf("allowed_network_types_for_reasons=");
+                        if (idx >= 0) {
+                            String reasons = t.substring(idx + "allowed_network_types_for_reasons=".length()).trim();
+                            snap.cellBlock[sid].currentUserRaf = CellBlockConfig.parseUserRafFromReasons(reasons);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (t.startsWith("GsmCdmaPhone extends:")) {
+                hasGsmHeader = true;
+                expectingGsmPhoneId = true;
+                curPhoneSlot = -1;
+                continue;
+            }
+            Matcher mPid = IMS_PHONE_ID_LINE.matcher(t);
+            if (mPid.matches()) {
+                int pid = parseIntSafe(mPid.group(1), -1);
+                if ((!hasGsmHeader || expectingGsmPhoneId) && (pid == 0 || pid == 1)) {
+                    curPhoneSlot = pid;
+                    expectingGsmPhoneId = false;
+                }
+                continue;
+            }
+            boolean isSsLine = t.startsWith("mSS={") || t.startsWith("mSS = {");
+            if (isSsLine
+                    && (t.contains("transportType=WWAN") || t.contains("isManualNetworkSelection="))
+                    && curPhoneSlot >= 0 && curPhoneSlot < 2 && !capturedSs[curPhoneSlot]) {
+                capturedSs[curPhoneSlot] = true;
+                snap.cellBlock[curPhoneSlot].manualSelection = t.contains("isManualNetworkSelection=true");
+                snap.cellBlock[curPhoneSlot].wwanVoiceReg = extractWwanRegState(t, "CS");
+                snap.cellBlock[curPhoneSlot].wwanDataReg = extractWwanRegState(t, "PS");
+                snap.cellBlock[curPhoneSlot].wwanPlmn = extractWwanRplmn(t);
+            }
+        }
+    }
+
+    private static int parseIntSafe(String s, int def) {
+        if (s == null) {
+            return def;
+        }
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (NumberFormatException ignored) {
+            return def;
+        }
+    }
+
+    private static String extractWwanRegState(String mSsLine, String domain) {
+        Pattern p = Pattern.compile("domain=" + domain + "\\s+transportType=WWAN\\s+registrationState=([A-Za-z0-9_]+)");
+        Matcher m = p.matcher(mSsLine);
+        return m.find() ? m.group(1).trim() : "";
+    }
+
+    private static String extractWwanRplmn(String mSsLine) {
+        String rplmn = extractRplmnFromDomain(mSsLine, "domain=PS transportType=WWAN");
+        if (!rplmn.isEmpty()) {
+            return rplmn;
+        }
+        return extractRplmnFromDomain(mSsLine, "domain=CS transportType=WWAN");
+    }
+
+    private static String extractRplmnFromDomain(String mSsLine, String domainMarker) {
+        int start = mSsLine.indexOf(domainMarker);
+        if (start < 0) {
+            return "";
+        }
+        int from = start + domainMarker.length();
+        int nextInfo = mSsLine.indexOf("NetworkRegistrationInfo{", from);
+        int endList = mSsLine.indexOf("]}", from);
+        int end = mSsLine.length();
+        if (nextInfo >= 0) {
+            end = Math.min(end, nextInfo);
+        }
+        if (endList >= 0) {
+            end = Math.min(end, endList);
+        }
+        Matcher m = Pattern.compile("rRplmn=([0-9]*)").matcher(mSsLine.substring(start, end));
+        return m.find() ? m.group(1).trim() : "";
     }
 
     /**

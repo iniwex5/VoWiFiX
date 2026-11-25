@@ -10,7 +10,7 @@ ROOT_MOD_DIR="$ROOT_DIR/root-module"
 BIN_OUT="$ROOT_MOD_DIR/system/bin/vowifix-efs"
 LSP_DIR="$ROOT_DIR/lsposed-module"
 
-VERSION="v1.0.5"
+VERSION="v1.0.6"
 ZIP_OUT="$DIST_DIR/VoWiFiX-${VERSION}.zip"
 APK_OUT="$DIST_DIR/VoWiFiX-LSPosed-${VERSION}.apk"
 
@@ -129,7 +129,8 @@ build_root_module() {
     chmod 0755 "$BIN_OUT"
     sh -n "$ROOT_MOD_DIR/customize.sh"
     sh -n "$ROOT_MOD_DIR/service.sh"
-    chmod 0755 "$ROOT_MOD_DIR/customize.sh" "$ROOT_MOD_DIR/service.sh"
+    sh -n "$ROOT_MOD_DIR/uninstall.sh"
+    chmod 0755 "$ROOT_MOD_DIR/customize.sh" "$ROOT_MOD_DIR/service.sh" "$ROOT_MOD_DIR/uninstall.sh"
 
     rm -f "$ZIP_OUT"
     (cd "$ROOT_MOD_DIR" && zip -r9 "$ZIP_OUT" . -x '*.DS_Store*')

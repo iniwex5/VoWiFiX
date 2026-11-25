@@ -69,6 +69,14 @@ public class VoWiFiXEntry implements IXposedHookLoadPackage {
             }
         }
 
+        if ("com.android.phone".equals(lpparam.packageName)) {
+            try {
+                CellBlockHook.init(lpparam);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + "CellBlockHook failed in " + lpparam.packageName + ": " + t);
+            }
+        }
+
         try {
             LocationGeoHook.init(lpparam);
         } catch (Throwable t) {

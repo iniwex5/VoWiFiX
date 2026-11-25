@@ -60,11 +60,13 @@ public class MainActivity extends Activity {
     private Switch switchWatcher;
     private TextView tvWatcherHint;
 
+    private Switch switchCellExemptCn;
     private final SlotViews[] slotViews = new SlotViews[2];
 
     private TextView tvProgressBanner;
     private TextView btnHotAdapt;
     private TextView btnRefreshModem;
+    private TextView btnRestoreCellular;
     private TextView btnRestoreEfs;
     private TextView btnRadioInfo;
 
@@ -78,6 +80,7 @@ public class MainActivity extends Activity {
     private TelephonyProbe.FullSnapshot latestSnapshot;
     private Runnable countdownRunnable;
     private Runnable postRefreshAutoProbeRunnable;
+    private final Runnable[] postCellRefreshRunnables = new Runnable[3];
 
     private static final class SlotViews {
         LinearLayout box;
@@ -87,6 +90,9 @@ public class MainActivity extends Activity {
         TextView tvRoamingLine;
         TextView tvIniStatus;
         TextView tvSeStatus;
+        TextView badgeCellBlock;
+        Switch switchCellBlock;
+        TextView tvCellBlockHint;
     }
 
     @Override
@@ -121,6 +127,7 @@ public class MainActivity extends Activity {
         if (postRefreshAutoProbeRunnable != null) {
             mainHandler.removeCallbacks(postRefreshAutoProbeRunnable);
         }
+        cancelPostCellRefresh();
         worker.shutdownNow();
     }
 
@@ -235,7 +242,7 @@ public class MainActivity extends Activity {
         tvApp.setTypeface(Typeface.DEFAULT_BOLD);
         titleGroup.addView(tvApp);
 
-        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.5", palette.accent, palette.accentBg);
+        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.6", palette.accent, palette.accentBg);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         verLp.leftMargin = UiHelper.dp(this, 8);
@@ -371,7 +378,39 @@ public class MainActivity extends Activity {
         LinearLayout card = UiHelper.makeCard(this, palette);
         card.addView(UiHelper.makeSectionTitle(this, palette, "双卡与底层 EFS 状态"));
 
+        LinearLayout exemptRow = new LinearLayout(this);
+        exemptRow.setOrientation(LinearLayout.HORIZONTAL);
+        exemptRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout exemptTextCol = new LinearLayout(this);
+        exemptTextCol.setOrientation(LinearLayout.VERTICAL);
+        exemptTextCol.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView tvExemptTitle = new TextView(this);
+        tvExemptTitle.setText("自动豁免国内卡 (MCC=460)");
+        tvExemptTitle.setTextColor(palette.textPrimary);
+        tvExemptTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tvExemptTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        exemptTextCol.addView(tvExemptTitle);
+
+        TextView tvExemptHint = new TextView(this);
+        tvExemptHint.setText("插入国内 460 卡自动恢复蜂窝，切回海外卡自动恢复屏蔽");
+        tvExemptHint.setTextColor(palette.textSecondary);
+        tvExemptHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        exemptTextCol.addView(tvExemptHint);
+
+        switchCellExemptCn = new Switch(this);
+        switchCellExemptCn.setChecked(true);
+        switchCellExemptCn.setOnCheckedChangeListener(this::onCellExemptSwitchChanged);
+
+        exemptRow.addView(exemptTextCol);
+        exemptRow.addView(switchCellExemptCn);
+        card.addView(exemptRow);
+        card.addView(UiHelper.makeDivider(this, palette, 10));
+
         for (int i = 0; i < 2; i++) {
+            final int slotIdx = i;
             SlotViews sv = new SlotViews();
             sv.box = new LinearLayout(this);
             sv.box.setOrientation(LinearLayout.VERTICAL);
@@ -414,6 +453,44 @@ public class MainActivity extends Activity {
             sv.box.addView(sv.tvIniStatus);
             sv.box.addView(sv.tvSeStatus);
 
+            sv.box.addView(UiHelper.makeDivider(this, palette, 8));
+
+            LinearLayout cellRow = new LinearLayout(this);
+            cellRow.setOrientation(LinearLayout.HORIZONTAL);
+            cellRow.setGravity(Gravity.CENTER_VERTICAL);
+
+            LinearLayout cellLabelGroup = new LinearLayout(this);
+            cellLabelGroup.setOrientation(LinearLayout.HORIZONTAL);
+            cellLabelGroup.setGravity(Gravity.CENTER_VERTICAL);
+            cellLabelGroup.setLayoutParams(new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            TextView tvCellTitle = new TextView(this);
+            tvCellTitle.setText("禁蜂窝纯 VoWiFi");
+            tvCellTitle.setTextColor(palette.textPrimary);
+            tvCellTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            tvCellTitle.setTypeface(Typeface.DEFAULT_BOLD);
+            cellLabelGroup.addView(tvCellTitle);
+
+            sv.badgeCellBlock = UiHelper.makeBadge(this, "未开启", palette.neutral, palette.neutralBg);
+            LinearLayout.LayoutParams cbBadgeLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            cbBadgeLp.leftMargin = UiHelper.dp(this, 6);
+            sv.badgeCellBlock.setLayoutParams(cbBadgeLp);
+            cellLabelGroup.addView(sv.badgeCellBlock);
+
+            sv.switchCellBlock = new Switch(this);
+            sv.switchCellBlock.setOnCheckedChangeListener((btn, checked) -> onCellBlockSwitchChanged(slotIdx, checked));
+
+            cellRow.addView(cellLabelGroup);
+            cellRow.addView(sv.switchCellBlock);
+            sv.box.addView(cellRow);
+
+            sv.tvCellBlockHint = makeSlotSubLine(3);
+            sv.tvCellBlockHint.setText("保持正常蜂窝自动选网（开启后将锁定空网 00101，保留完整 3GPP/VoWiFi 能力）");
+            sv.tvCellBlockHint.setTextColor(palette.textMuted);
+            sv.box.addView(sv.tvCellBlockHint);
+
             slotViews[i] = sv;
             card.addView(sv.box);
         }
@@ -452,16 +529,21 @@ public class MainActivity extends Activity {
 
         btnHotAdapt = UiHelper.makeActionButton(this, palette, "一键热适配", UiHelper.BTN_PRIMARY);
         btnRefreshModem = UiHelper.makeActionButton(this, palette, "仅触发基带热刷新", UiHelper.BTN_SECONDARY);
-        btnRestoreEfs = UiHelper.makeActionButton(this, palette, "还原原始 EFS 备份", UiHelper.BTN_DANGER);
+        btnRestoreCellular = UiHelper.makeActionButton(this, palette, "一键恢复全部蜂窝驻网", UiHelper.BTN_SECONDARY);
         btnRadioInfo = UiHelper.makeActionButton(this, palette, "打开系统 RadioInfo", UiHelper.BTN_SECONDARY);
+        btnRestoreEfs = UiHelper.makeActionButton(this, palette, "还原原始 EFS 备份", UiHelper.BTN_DANGER);
 
         btnHotAdapt.setOnClickListener(v -> onHotAdaptClicked());
         btnRefreshModem.setOnClickListener(v -> onRefreshModemClicked());
-        btnRestoreEfs.setOnClickListener(v -> onRestoreEfsClicked());
+        btnRestoreCellular.setOnClickListener(v -> onRestoreAllCellularClicked());
         btnRadioInfo.setOnClickListener(v -> onOpenRadioInfoClicked());
+        btnRestoreEfs.setOnClickListener(v -> onRestoreEfsClicked());
 
         card.addView(makeButtonRow(btnHotAdapt, btnRefreshModem, 10));
-        card.addView(makeButtonRow(btnRestoreEfs, btnRadioInfo, 0));
+        card.addView(makeButtonRow(btnRestoreCellular, btnRadioInfo, 10));
+        btnRestoreEfs.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(btnRestoreEfs);
         return card;
     }
 
@@ -629,8 +711,14 @@ public class MainActivity extends Activity {
 
         suppressSwitchEvent = true;
         switchWatcher.setChecked(snap.hasRoot ? snap.watcherEnabled : false);
+        if (switchCellExemptCn != null) {
+            switchCellExemptCn.setChecked(snap.cellExemptCn);
+        }
         suppressSwitchEvent = false;
         switchWatcher.setEnabled(!busy && snap.hasRoot && snap.moduleInstalled);
+        if (switchCellExemptCn != null) {
+            switchCellExemptCn.setEnabled(!busy && snap.hasRoot);
+        }
         if (!snap.hasRoot) {
             tvWatcherHint.setText("授予 Root 权限后可控制后台切卡守护");
         } else if (!snap.watcherEnabled) {
@@ -642,7 +730,7 @@ public class MainActivity extends Activity {
         }
 
         for (int i = 0; i < 2; i++) {
-            renderSlot(slotViews[i], snap.slots[i], snap.efs[i], snap.hasRoot);
+            renderSlot(slotViews[i], snap.slots[i], snap.efs[i], snap.cellBlock[i], snap.hasRoot);
         }
 
         if (!snap.hasRoot) {
@@ -671,7 +759,9 @@ public class MainActivity extends Activity {
 
     private void renderSlot(
             SlotViews sv, TelephonyProbe.SlotSnapshot slot,
-            TelephonyProbe.EfsSlotStatus efs, boolean hasRoot) {
+            TelephonyProbe.EfsSlotStatus efs,
+            TelephonyProbe.CellBlockSlotStatus cb,
+            boolean hasRoot) {
         int slotNo = slot.slotIndex + 1;
         if (slot.isSimAbsent()) {
             sv.tvTitle.setText("卡 " + slotNo + " · 未插卡");
@@ -696,7 +786,15 @@ public class MainActivity extends Activity {
             sv.tvOperatorLine.setText("归属国家: " + iso + "  ·  SIM: " + slot.simState + "  ·  网络: " + netType);
 
             sv.tvRoamingLine.setVisibility(View.VISIBLE);
-            if (slot.isRoamingOnCellular()) {
+            if (hasRoot && cb.isZeroCellularRegistered()) {
+                if (slot.isVoWiFi() || "IWLAN".equalsIgnoreCase(slot.netType)) {
+                    sv.tvRoamingLine.setText("漫游状态: 未驻留蜂窝网络（仅 Wi-Fi / 零驻网）");
+                    sv.tvRoamingLine.setTextColor(palette.textSecondary);
+                } else {
+                    sv.tvRoamingLine.setText("漫游状态: 未驻留蜂窝网络（无服务）");
+                    sv.tvRoamingLine.setTextColor(palette.textMuted);
+                }
+            } else if (slot.isRoamingOnCellular()) {
                 String hostNet = slot.netAlpha.isEmpty() ? slot.netNumeric : slot.netAlpha + " (" + slot.netNumeric + ")";
                 sv.tvRoamingLine.setText("漫游状态: 国际漫游中 · 驻留 " + hostNet);
                 sv.tvRoamingLine.setTextColor(palette.warning);
@@ -718,11 +816,19 @@ public class MainActivity extends Activity {
             }
         }
 
+        suppressSwitchEvent = true;
+        sv.switchCellBlock.setChecked(hasRoot && cb.ruleEnabled);
+        suppressSwitchEvent = false;
+        sv.switchCellBlock.setEnabled(!busy && hasRoot);
+
         if (!hasRoot) {
             sv.tvIniStatus.setText("配置合并: 需要 Root 权限");
             sv.tvIniStatus.setTextColor(palette.textMuted);
             sv.tvSeStatus.setText("漫游解锁: 需要 Root 权限");
             sv.tvSeStatus.setTextColor(palette.textMuted);
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "需 Root", palette.neutral, palette.neutralBg);
+            sv.tvCellBlockHint.setText("授予 Root 权限后可控制单卡禁蜂窝纯 VoWiFi");
+            sv.tvCellBlockHint.setTextColor(palette.textMuted);
             return;
         }
 
@@ -731,6 +837,206 @@ public class MainActivity extends Activity {
 
         sv.tvSeStatus.setText(efs.getSeSummaryText());
         sv.tvSeStatus.setTextColor(resolveEfsLineColor(efs.seState));
+
+        renderCellBlockSlot(sv, slot, cb);
+    }
+
+    private void renderCellBlockSlot(
+            SlotViews sv, TelephonyProbe.SlotSnapshot slot, TelephonyProbe.CellBlockSlotStatus cb) {
+        if (!cb.ruleEnabled) {
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "未开启", palette.neutral, palette.neutralBg);
+            sv.tvCellBlockHint.setText("保持正常蜂窝自动选网（开启后将锁定空网 "
+                    + CellBlockConfig.BLOCK_PLMN + "，保留完整 3GPP/VoWiFi 能力）");
+            sv.tvCellBlockHint.setTextColor(palette.textMuted);
+            return;
+        }
+
+        if (cb.exemptCnActive) {
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "已豁免 (460)", palette.info, palette.infoBg);
+            sv.tvCellBlockHint.setText("规则已开启 · 国内卡 (460) 自动豁免恢复蜂窝，切回海外卡自动锁定空网");
+            sv.tvCellBlockHint.setTextColor(palette.info);
+            return;
+        }
+
+        if (slot.isSimAbsent()) {
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "规则开启 · 无卡", palette.neutral, palette.neutralBg);
+            sv.tvCellBlockHint.setText("物理卡槽已绑定禁蜂窝规则，插卡后将自动拦截非豁免海外卡");
+            sv.tvCellBlockHint.setTextColor(palette.textMuted);
+            return;
+        }
+
+        if (latestSnapshot != null && !latestSnapshot.lsposedActive) {
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "需启用 Hook", palette.warning, palette.warningBg);
+            sv.tvCellBlockHint.setText("需在 LSPosed 启用 VoWiFiX 模块并勾选「电话服务」方可生效");
+            sv.tvCellBlockHint.setTextColor(palette.warning);
+            return;
+        }
+
+        if (cb.isManualZeroCellularLocked()) {
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "零驻网生效", palette.success, palette.successBg);
+            sv.tvCellBlockHint.setText("已锁定空网 " + CellBlockConfig.BLOCK_PLMN + " · WWAN 零蜂窝附着（VoWiFi 通话正常）");
+            sv.tvCellBlockHint.setTextColor(palette.success);
+        } else if (cb.isZeroCellularRegistered()) {
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "规则已启用", palette.warning, palette.warningBg);
+            sv.tvCellBlockHint.setText("当前无蜂窝信号 · 等待锁定手动空网 " + CellBlockConfig.BLOCK_PLMN);
+            sv.tvCellBlockHint.setTextColor(palette.warning);
+        } else {
+            UiHelper.styleBadge(this, sv.badgeCellBlock, "规则已启用", palette.warning, palette.warningBg);
+            String wwanDesc = !cb.wwanPlmn.isEmpty()
+                    ? "WWAN 驻留 " + cb.wwanPlmn
+                    : (!cb.wwanVoiceReg.isEmpty() || !cb.wwanDataReg.isEmpty()
+                            ? "WWAN CS=" + cb.wwanVoiceReg + " PS=" + cb.wwanDataReg
+                            : "正在锁定空网");
+            sv.tvCellBlockHint.setText("正在锁定空网 " + CellBlockConfig.BLOCK_PLMN + " · " + wwanDesc);
+            sv.tvCellBlockHint.setTextColor(palette.warning);
+        }
+    }
+
+    private void onCellExemptSwitchChanged(CompoundButton buttonView, boolean isChecked) {
+        if (suppressSwitchEvent || busy || latestSnapshot == null || !latestSnapshot.hasRoot) {
+            return;
+        }
+        handleCellRuleChangeRequest(
+                latestSnapshot.cellBlock[0].ruleEnabled,
+                latestSnapshot.cellBlock[1].ruleEnabled,
+                isChecked);
+    }
+
+    private void onCellBlockSwitchChanged(int slotIndex, boolean isChecked) {
+        if (suppressSwitchEvent || busy || latestSnapshot == null || !latestSnapshot.hasRoot) {
+            return;
+        }
+        boolean nextS0 = slotIndex == 0 ? isChecked : latestSnapshot.cellBlock[0].ruleEnabled;
+        boolean nextS1 = slotIndex == 1 ? isChecked : latestSnapshot.cellBlock[1].ruleEnabled;
+        handleCellRuleChangeRequest(nextS0, nextS1, latestSnapshot.cellExemptCn);
+    }
+
+    private void syncCellSwitchesFromSnapshot() {
+        if (latestSnapshot == null) {
+            return;
+        }
+        suppressSwitchEvent = true;
+        if (switchCellExemptCn != null) {
+            switchCellExemptCn.setChecked(latestSnapshot.cellExemptCn);
+        }
+        for (int i = 0; i < 2; i++) {
+            if (slotViews[i] != null && slotViews[i].switchCellBlock != null) {
+                slotViews[i].switchCellBlock.setChecked(
+                        latestSnapshot.hasRoot && latestSnapshot.cellBlock[i].ruleEnabled);
+            }
+        }
+        suppressSwitchEvent = false;
+    }
+
+    private void handleCellRuleChangeRequest(
+            final boolean nextS0, final boolean nextS1, final boolean nextExemptCn) {
+        boolean bothSlotsPresent = !latestSnapshot.slots[0].isSimAbsent()
+                && !latestSnapshot.slots[1].isSimAbsent();
+        boolean s0Exempt = nextExemptCn
+                && latestSnapshot.slots[0].isSimLoaded()
+                && CellBlockConfig.isChinaMainlandPlmn(latestSnapshot.slots[0].simNumeric);
+        boolean s1Exempt = nextExemptCn
+                && latestSnapshot.slots[1].isSimLoaded()
+                && CellBlockConfig.isChinaMainlandPlmn(latestSnapshot.slots[1].simNumeric);
+
+        if (bothSlotsPresent && nextS0 && nextS1 && !s0Exempt && !s1Exempt) {
+            syncCellSwitchesFromSnapshot();
+            new AlertDialog.Builder(this)
+                    .setTitle("警告：双卡将同时断开蜂窝网络")
+                    .setMessage("当前两张卡槽均未处于国内卡 (460) 豁免状态。\n\n"
+                            + "同时开启双卡「禁蜂窝纯 VoWiFi」后，离开 Wi-Fi 期间整机双卡将彻底断网，无法接打电话、收发短信、使用移动数据，也无法为新基带提供跨卡流量。\n\n"
+                            + "确定仍要同时对卡 1 与卡 2 开启禁蜂窝吗？")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("仍然开启", (d, w) ->
+                            applyCellBlockConfigAsync(nextS0, nextS1, nextExemptCn))
+                    .show();
+            return;
+        }
+        applyCellBlockConfigAsync(nextS0, nextS1, nextExemptCn);
+    }
+
+    private void applyCellBlockConfigAsync(
+            final boolean slot0Block, final boolean slot1Block, final boolean exemptCn) {
+        if (busy || latestSnapshot == null || !latestSnapshot.hasRoot) {
+            return;
+        }
+        setBusy(true, "正在同步单卡禁蜂窝策略...");
+        worker.execute(() -> {
+            if (TelephonyProbe.isCallActive()) {
+                mainHandler.post(() -> {
+                    if (isDestroyed()) {
+                        return;
+                    }
+                    setBusy(false, "检测到正在通话或来电，已暂缓变更蜂窝选网状态");
+                    syncCellSwitchesFromSnapshot();
+                });
+                return;
+            }
+            String script = CellBlockConfig.buildApplyRulesShellScript(slot0Block, slot1Block, exemptCn, "ui");
+            RootShell.Result r = RootShell.execRoot(script, 20);
+            mainHandler.post(() -> {
+                if (isDestroyed()) {
+                    return;
+                }
+                setBusy(false, r.isSuccess()
+                        ? "已更新单卡禁蜂窝规则"
+                        : "更新禁蜂窝规则失败: " + summarizeLastLine(r.stderr));
+                refreshStateAsync(false, true, true);
+                schedulePostCellActionRefresh();
+            });
+        });
+    }
+
+    private void onRestoreAllCellularClicked() {
+        if (busy || latestSnapshot == null || !latestSnapshot.hasRoot) {
+            return;
+        }
+        setBusy(true, "正在检查通话状态并恢复全部蜂窝驻网...");
+        worker.execute(() -> {
+            if (TelephonyProbe.isCallActive()) {
+                mainHandler.post(() -> {
+                    if (!isDestroyed()) {
+                        setBusy(false, "检测到正在通话或来电，已暂缓恢复自动选网");
+                    }
+                });
+                return;
+            }
+            RootShell.Result r = RootShell.execRoot(CellBlockConfig.buildRestoreAllShellScript("ui"), 20);
+            mainHandler.post(() -> {
+                if (isDestroyed()) {
+                    return;
+                }
+                setBusy(false, r.isSuccess()
+                        ? "已一键恢复全部卡槽全自动选网与正常蜂窝驻网"
+                        : "恢复蜂窝驻网失败: " + summarizeLastLine(r.stderr));
+                refreshStateAsync(false, true, true);
+                schedulePostCellActionRefresh();
+            });
+        });
+    }
+
+    private void cancelPostCellRefresh() {
+        for (int i = 0; i < postCellRefreshRunnables.length; i++) {
+            if (postCellRefreshRunnables[i] != null) {
+                mainHandler.removeCallbacks(postCellRefreshRunnables[i]);
+                postCellRefreshRunnables[i] = null;
+            }
+        }
+    }
+
+    private void schedulePostCellActionRefresh() {
+        cancelPostCellRefresh();
+        final long[] delaysMs = new long[]{1500L, 4500L, 9000L};
+        for (int i = 0; i < postCellRefreshRunnables.length && i < delaysMs.length; i++) {
+            final int idx = i;
+            postCellRefreshRunnables[idx] = () -> {
+                postCellRefreshRunnables[idx] = null;
+                if (!isDestroyed() && !busy) {
+                    refreshStateAsync(false, true, true);
+                }
+            };
+            mainHandler.postDelayed(postCellRefreshRunnables[idx], delaysMs[idx]);
+        }
     }
 
     private void onWatcherSwitchChanged(CompoundButton buttonView, boolean isChecked) {
@@ -1189,6 +1495,7 @@ public class MainActivity extends Activity {
 
         UiHelper.applyButtonStyle(this, palette, btnHotAdapt, UiHelper.BTN_PRIMARY, canModem);
         UiHelper.applyButtonStyle(this, palette, btnRefreshModem, UiHelper.BTN_SECONDARY, canModem);
+        UiHelper.applyButtonStyle(this, palette, btnRestoreCellular, UiHelper.BTN_SECONDARY, !busy && hasRoot);
         UiHelper.applyButtonStyle(this, palette, btnRestoreEfs, UiHelper.BTN_DANGER, canRestore);
         UiHelper.applyButtonStyle(this, palette, btnRadioInfo, UiHelper.BTN_SECONDARY, !busy);
 
@@ -1203,6 +1510,14 @@ public class MainActivity extends Activity {
         }
         if (switchWatcher != null && latestSnapshot != null) {
             switchWatcher.setEnabled(!busy && hasRoot && latestSnapshot.moduleInstalled);
+        }
+        if (switchCellExemptCn != null) {
+            switchCellExemptCn.setEnabled(!busy && hasRoot);
+        }
+        for (int i = 0; i < 2; i++) {
+            if (slotViews[i] != null && slotViews[i].switchCellBlock != null) {
+                slotViews[i].switchCellBlock.setEnabled(!busy && hasRoot);
+            }
         }
     }
 

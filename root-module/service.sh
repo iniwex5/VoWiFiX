@@ -111,9 +111,116 @@ normalize_siminfo_wfc_mode() {
     done
 }
 
+CELL_CONF="$DATA_DIR/cell_block.conf"
+
+# 清理历史版本遗留的制式降级快照与隔离掩码，防止妨碍现行全制式 + 手动锁网策略
+is_legacy_iso_mask() {
+    case "$1" in
+        32|65536|2048|16|64|8|32768) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+int_to_bin20() {
+    v="$1"
+    out=""
+    i=0
+    while [ "$i" -lt 20 ] || [ "$v" -gt 0 ]; do
+        out="$((v % 2))$out"
+        v="$((v / 2))"
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
+migrate_legacy_slot_cell_snapshot() {
+    s="$1"
+    snap="$DATA_DIR/slot${s}_cell_orig.conf"
+    row="$(content query --uri content://telephony/siminfo --where "sim_id=$s" --projection _id:allowed_network_types_for_reasons 2>/dev/null | tr -d '\r' | grep '_id=' | head -n 1)"
+    cur_sub="$(printf '%s' "$row" | sed -nE 's/.*_id=([0-9]+).*/\1/p')"
+    cur_reasons="$(printf '%s' "$row" | sed -n 's/.*allowed_network_types_for_reasons=//p')"
+    cur_user="$(printf '%s' "$cur_reasons" | sed -nE 's/.*user=([0-9]+).*/\1/p')"
+
+    [ -f "$snap" ] || is_legacy_iso_mask "$cur_user" || return 0
+
+    ORIG_SUB_ID=""
+    ORIG_REASONS=""
+    ORIG_PREF_MODE=""
+    ORIG_OPLUS_USER_MODE=""
+    [ -f "$snap" ] && . "$snap"
+
+    target_raf=916479
+    orig_user="$(printf '%s' "$ORIG_REASONS" | sed -nE 's/.*user=([0-9]+).*/\1/p')"
+    if [ -n "$orig_user" ] && ! is_legacy_iso_mask "$orig_user"; then
+        target_raf="$orig_user"
+    fi
+    target_bin="$(int_to_bin20 "$target_raf")"
+
+    if [ -n "$cur_sub" ]; then
+        if [ "$cur_sub" = "$ORIG_SUB_ID" ] && [ -n "$ORIG_REASONS" ] && [ -n "$orig_user" ] && ! is_legacy_iso_mask "$orig_user"; then
+            content update --uri content://telephony/siminfo --where "_id=$cur_sub" \
+                --bind "allowed_network_types_for_reasons:s:$ORIG_REASONS" >/dev/null 2>&1
+            [ -n "$ORIG_PREF_MODE" ] && [ "$ORIG_PREF_MODE" != "null" ] && \
+                settings put global "preferred_network_mode${cur_sub}" "$ORIG_PREF_MODE" >/dev/null 2>&1
+            if [ -n "$ORIG_OPLUS_USER_MODE" ] && [ "$ORIG_OPLUS_USER_MODE" != "null" ]; then
+                settings put global "oplus_user_preferred_network_mode${cur_sub}" "$ORIG_OPLUS_USER_MODE" >/dev/null 2>&1
+            else
+                settings delete global "oplus_user_preferred_network_mode${cur_sub}" >/dev/null 2>&1
+            fi
+        else
+            settings delete global "oplus_user_preferred_network_mode${cur_sub}" >/dev/null 2>&1
+        fi
+        cmd phone set-allowed-network-types-for-users -s "$s" "$target_bin" >/dev/null 2>&1
+    fi
+
+    rm -f "$snap"
+    log_msg "INFO: slot$s migrated legacy rat snapshot (sub=$cur_sub, raf=$target_raf)"
+}
+
+# 将持久禁蜂窝配置同步到 Settings.Global，由进程内 CellBlockHook 执行手动锁空网 00101 与国内卡豁免恢复
+sync_cell_block_rules() {
+    reason="$1"
+    if [ ! -f "$CELL_CONF" ]; then
+        need_del=0
+        for s in 0 1; do
+            v="$(settings get global "vowifix_cell_block_slot${s}" 2>/dev/null)"
+            if [ "$v" = "1" ]; then
+                # 先置 0 通知进程内 ContentObserver 切回自动选网，延时后再删除残留控制键
+                settings put global "vowifix_cell_block_slot${s}" 0 >/dev/null 2>&1
+                need_del=1
+            fi
+            migrate_legacy_slot_cell_snapshot "$s"
+        done
+        if [ "$need_del" -eq 1 ]; then
+            sleep 2
+            settings delete global vowifix_cell_block_slot0 >/dev/null 2>&1
+            settings delete global vowifix_cell_block_slot1 >/dev/null 2>&1
+        fi
+        return 0
+    fi
+
+    SLOT0_BLOCK="$(sed -nE 's/^SLOT0_BLOCK=([01]).*/\1/p' "$CELL_CONF" | head -n 1)"
+    SLOT1_BLOCK="$(sed -nE 's/^SLOT1_BLOCK=([01]).*/\1/p' "$CELL_CONF" | head -n 1)"
+    EXEMPT_CN_460="$(sed -nE 's/^EXEMPT_CN_460=([01]).*/\1/p' "$CELL_CONF" | head -n 1)"
+    [ -z "$SLOT0_BLOCK" ] && SLOT0_BLOCK=0
+    [ -z "$SLOT1_BLOCK" ] && SLOT1_BLOCK=0
+    [ -z "$EXEMPT_CN_460" ] && EXEMPT_CN_460=1
+
+    [ "$(settings get global vowifix_cell_exempt_cn 2>/dev/null)" != "$EXEMPT_CN_460" ] && \
+        settings put global vowifix_cell_exempt_cn "$EXEMPT_CN_460" >/dev/null 2>&1
+    [ "$(settings get global vowifix_cell_block_slot0 2>/dev/null)" != "$SLOT0_BLOCK" ] && \
+        settings put global vowifix_cell_block_slot0 "$SLOT0_BLOCK" >/dev/null 2>&1
+    [ "$(settings get global vowifix_cell_block_slot1 2>/dev/null)" != "$SLOT1_BLOCK" ] && \
+        settings put global vowifix_cell_block_slot1 "$SLOT1_BLOCK" >/dev/null 2>&1
+
+    migrate_legacy_slot_cell_snapshot 0
+    migrate_legacy_slot_cell_snapshot 1
+    log_msg "INFO: [$reason] synced cell block rules (slot0=$SLOT0_BLOCK, slot1=$SLOT1_BLOCK, exempt_cn=$EXEMPT_CN_460)"
+}
+
 LAST_REFRESH_TS=0
 
-# 串行执行：等通话空闲 -> 持 shared flock -> 合并 EFS + 校准 siminfo -> 有写入则严格等 6s 落盘 -> QRTR 热刷新 -> 静候 20s 安全窗口
+# 串行执行：等通话空闲 -> 持 shared flock -> 合并 EFS + 校准 siminfo + 同步禁蜂窝规则 -> 有写入则严格等 6s 落盘 -> QRTR 热刷新 -> 静候 20s 安全窗口
 apply_patch_and_refresh() {
     reason="$1"
 
@@ -135,6 +242,7 @@ apply_patch_and_refresh() {
         # 无可用 Diag 通道（如 GKI 新平台）时进入仅上层与 siminfo 校准模式，跳过 EFS 写入避免报错刷屏
         log_msg "INFO: [$reason] no diag backend available (GKI/upper-layer only mode), skipping EFS patch (bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
         normalize_siminfo_wfc_mode "$reason"
+        sync_cell_block_rules "$reason"
         return 0
     fi
 
@@ -157,6 +265,7 @@ apply_patch_and_refresh() {
         log_msg "RC=$RC | $(echo "$OUT" | tr '\n' '; ')"
 
         normalize_siminfo_wfc_mode "$reason"
+        sync_cell_block_rules "$reason"
 
         [ "$RC" -ne 0 ] && exit 1
 
