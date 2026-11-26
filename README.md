@@ -13,7 +13,7 @@ VoWiFiX 将 **Root 基带 EFS 层工具**（`vowifix-efs` + 切卡自动守护�
   - 同步对活跃槽位 `/nv/item_files/ims/qp_ims_service_enablement_config` 执行最小 `3` 字节解锁（启用 Wi-Fi 通话总开关、将移动网络优先改回 Wi-Fi 优先、解除漫游强制禁用 VoWiFi），并对存在静态 `<fqdn>` 但原厂关闭开关的 `/data/iwlan_s2b_config.xml`（及副槽 `_Subscription01`）执行 XML 注释感知静态 FQDN 解锁，打通如香港 3HK 等依赖静态 ePDG 域名的运营商；
 - **跨卡热切换免重启自适应**
   - 常驻守护进程监听双卡 `gsm.sim.state` 与 `MCC/MNC` 变动，在切卡或漫游就绪后自动完成 EFS 合并、`telephony/siminfo` 历史策略校准，并通过 Qualcomm `QRTR` (`AF_QIPCRTR`) 按变更卡槽下发 `QMI_VS` 订阅绑定（`0x0021`）+ `0x008e` 独立/双槽热刷新（热插副卡时不打断主卡在线状态；即使 `CHANGED=0` 或无 Diag 降级模式仍定向刷新新卡，配合 `<8s` 快速重插锁存与按槽独立 `45s` 冷却），无需重启即可生效；
-  - 自 `v1.0.1` 起引入多后端 Diag 传输层抽象与无副作用探测（`vowifix-efs detect`）：单文件静态二进制即可自动适配旧平台 `/dev/diag` 与骁龙 8 Gen 2 / 8 Gen 3 / 8 Elite 等 GKI 新平台的 `diag-router`；对极少数完全封禁 Diag 的商用 ROM 也会优雅切换至“上层解锁 + `siminfo` 校准 + QRTR 刷新”模式，消除开机等待超时与报错刷屏。
+  - 自 `v1.0.1` 起引入多后端 Diag 传输层抽象与无副作用探测（`vowifix-efs detect`）：单文件静态二进制即可自动适配旧平台 `/dev/diag`（精确对齐 msm-4.4~4.19 内核 `diagchar` 24B ABI、`MEMORY_DEVICE_MODE` 本地会话校验与 `ITIMER_REAL/SIGALRM` 防挂死硬超时）与骁龙 8 Gen 2 / 8 Gen 3 / 8 Elite 等 GKI 新平台的 `diag-router`；对完全封禁 Diag 的商用 ROM（或手动配置 `/data/adb/vowifix/backend.conf` 写入 `BACKEND=none`）自动切换至“上层解锁 + `siminfo` 校准 + QRTR 刷新”模式，消除开机等待超时与锁死。
 - **LSPosed 全作用域解锁与按槽伪装**
   - 绕过系统/ColorOS `CarrierConfig` 开关隐藏、Entitlement/Provisioning 云端资格校验，强制 `WIFI_PREFERRED`、`EPDG_ADDRESS_PLMN` 与 `{0, 1}` 地址优先级（静态配置优先、PLMN 回退）；开启 `wfc_carrier_name_override_by_pnn_bool` 与双架构归属运营商名防空兜底，修复无 `EF_SPN` 卡在漫游 VoWiFi 下显示驻留基站名称的问题；
   - 按卡槽自适应返回 SIM 归属 ISO 国家码并拦截基站/Wi-Fi PANI/CNI/地理位置上报；基于跨槽物理所在国 MCC 与有效蜂窝制式过滤（排除 `200..799` 之外测试网与无蜂窝/`IWLAN` 假归属 PLMN），并叠加 `NITZ` 与系统时区双重源头守卫，确保海外卡全程维持伪装且不污染系统自动时区。
@@ -81,10 +81,10 @@ flowchart TB
 ### 1. 安装模块与插件
 
 1. 从 Releases 下载（或自行构建）：
-   - `VoWiFiX-v1.0.7.zip`（Root 模块，模块 ID：`vowifix`）
-   - `VoWiFiX-LSPosed-v1.0.7.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
-2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.7.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
-3. 安装 `VoWiFiX-LSPosed-v1.0.7.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
+   - `VoWiFiX-v1.0.8.zip`（Root 模块，模块 ID：`vowifix`）
+   - `VoWiFiX-LSPosed-v1.0.8.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
+2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.8.zip`（若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
+3. 安装 `VoWiFiX-LSPosed-v1.0.8.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
    - `android` / `system`（系统框架）
    - `com.android.phone`（电话服务）
    - `com.android.settings`（系统设置）

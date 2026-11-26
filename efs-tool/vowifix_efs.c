@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,11 +20,22 @@
 #define DIAG_IOCTL_SWITCH_LOGGING 7
 #define DIAG_IOCTL_REMOTE_DEV 32
 #define DIAG_IOCTL_REGISTER_CALLBACK 37
+#define DIAG_IOCTL_QUERY_MD_PID 41
 
+#define MEMORY_DEVICE_MODE 2
 #define CALLBACK_MODE 6
 #define NO_LOGGING_MODE 7
 #define USER_SPACE_DATA_TYPE 0x20
 #define DIAG_REMOTE_MDM1_BIT 0x0001U
+#define DIAG_CON_MPSS 0x0002U
+#define DIAG_CON_ALL 0x00FFU
+#define DIAG_CON_ALL_EXT 0x03FFU
+#define DIAG_CON_LEGACY_ALL 0x0FFFU
+
+#define EXIT_CODE_LOCK_BUSY 99
+#define EXIT_CODE_TIMEOUT 124
+#define DEFAULT_READ_TIMEOUT_SEC 12
+#define DEFAULT_WRITE_TIMEOUT_SEC 45
 
 /* GKI 用户态 diag-router UNIX SEQPACKET 控制信令字 */
 #define DIAG_ROUTER_CMD_REMOTE_DEV 0x33U
@@ -56,6 +68,7 @@
 #define EFS_S2B_PATH_SLOT1 "/data/iwlan_s2b_config.xml_Subscription01"
 #define DEFAULT_BACKUP_DIR "/data/adb/vowifix"
 #define DEFAULT_LOCK_PATH "/data/adb/vowifix/diag.lock"
+#define DEFAULT_BACKEND_CONF "/data/adb/vowifix/backend.conf"
 
 /* Qualcomm QRTR 与 QMI VS EFS 热刷新参数（无需加载外部动态库） */
 #ifndef AF_QIPCRTR
@@ -84,6 +97,7 @@ typedef enum {
     REFRESH_SLOT_1 = 1
 } refresh_slot_opt_t;
 
+/* GKI 用户态 diag-router SWITCH_LOGGING 24B 载荷结构（偏移 16=diag_id, 20=pd_val） */
 struct __attribute__((packed)) diag_logging_mode_param_t {
     uint32_t req_mode;
     uint32_t peripheral_mask;
@@ -92,6 +106,27 @@ struct __attribute__((packed)) diag_logging_mode_param_t {
     uint8_t pad[3];
     int32_t diag_id;
     uint32_t pd_val;
+};
+
+/* 传统内核态 /dev/diag (diagchar.h) SWITCH_LOGGING 参数结构体（24B：偏移 13/14 单字节，16/20 peripheral/device_mask） */
+struct __attribute__((packed)) diagchar_logging_mode_param_t {
+    uint32_t req_mode;
+    uint32_t peripheral_mask;
+    uint32_t pd_mask;
+    uint8_t mode_param;
+    uint8_t diag_id;
+    uint8_t pd_val;
+    uint8_t reserved;
+    int32_t peripheral;
+    int32_t device_mask;
+};
+
+/* 内核 DIAG_IOCTL_QUERY_MD_PID (41) 会话 PID 查询结构（16B） */
+struct diag_query_pid_t {
+    uint32_t peripheral_mask;
+    uint32_t pd_mask;
+    int32_t pid;
+    int32_t device_mask;
 };
 
 typedef enum {
@@ -243,182 +278,116 @@ static int match_response(const uint8_t *cmd, int cmd_len, const uint8_t *rsp, i
     return 1;
 }
 
-/* 根据命令行模式选项与远端掩码判断是否启用外挂基带 MDM1：
- * 仅 bit0 (0x0001) 代表外挂主基带 MDM1；0x0002 等第二协处理器位不得误判为外挂基带。 */
-static int diag_resolve_is_remote(diag_mode_opt_t mode_opt, uint16_t remote_mask) {
-    if (mode_opt == DIAG_MODE_REMOTE) return 1;
-    if (mode_opt == DIAG_MODE_LOCAL) return 0;
-    return (remote_mask & DIAG_REMOTE_MDM1_BIT) ? 1 : 0;
+/* ===================== 运行时防阻塞超时与共享协议帧编码 ===================== */
+
+static volatile sig_atomic_t g_io_timed_out = 0;
+static volatile sig_atomic_t g_cmd_timed_out = 0;
+static volatile sig_atomic_t g_saw_diag_timeout = 0;
+static volatile sig_atomic_t g_efs_write_critical = 0;
+static long g_cmd_deadline_ms = 0;
+static int g_alarm_installed = 0;
+
+static long diag_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
 }
 
-/* 计算 SWITCH_LOGGING 的 pd_val：仅激活内置 MPSS (1u) 或再叠加外挂 MDM1 (3u)，
- * 绝不混入 0x0002 等无关远端掩码位。 */
-static uint32_t diag_compute_pd_val(int is_remote) {
-    return is_remote ? (1u | (DIAG_REMOTE_MDM1_BIT << 1)) : 1u;
+static void on_sigalrm(int sig) {
+    (void)sig;
+    g_io_timed_out = 1;
 }
 
-/* 无副作用轻量探测 /dev/diag 字符设备是否存在（不切换 logging mode） */
-static int diagchar_detect(void) {
-    struct stat st;
-    if (stat("/dev/diag", &st) != 0) return 0;
-    return S_ISCHR(st.st_mode) ? 1 : 0;
-}
-
-/* 自动或按需开启 /dev/diag 并切换到对应外挂 MDM 或内置 MPSS 的 CALLBACK 模式 */
-static int diagchar_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
-    ctx->fd = -1;
-    ctx->token = 0;
-    ctx->remote_mask = 0;
-    ctx->is_remote = 0;
-
-    ctx->fd = open("/dev/diag", O_RDWR | O_CLOEXEC);
-    if (ctx->fd < 0) {
-        fprintf(stderr, "open(/dev/diag) failed: errno=%d (%s)\n", errno, strerror(errno));
-        return -1;
-    }
-
-    uint16_t remote_mask = 0;
-    if (ioctl(ctx->fd, DIAG_IOCTL_REMOTE_DEV, &remote_mask) < 0) {
-        remote_mask = 0;
-    }
-    ctx->remote_mask = remote_mask;
-    ctx->is_remote = diag_resolve_is_remote(mode_opt, remote_mask);
-    ctx->token = ctx->is_remote ? -1 : 0;
-
-    int client_id = 0;
-    ioctl(ctx->fd, DIAG_IOCTL_REGISTER_CALLBACK, &client_id);
-
-    struct diag_logging_mode_param_t mode;
-    memset(&mode, 0, sizeof(mode));
-    mode.req_mode = CALLBACK_MODE;
-    mode.peripheral_mask = 0xFFF;
-    mode.pd_mask = 0;
-    mode.mode_param = 1;
-    mode.diag_id = -22;
-    mode.pd_val = diag_compute_pd_val(ctx->is_remote);
-
-    if (ioctl(ctx->fd, DIAG_IOCTL_SWITCH_LOGGING, &mode) < 0) {
-        fprintf(stderr, "ioctl(DIAG_IOCTL_SWITCH_LOGGING) failed: errno=%d (%s)\n", errno, strerror(errno));
-        close(ctx->fd);
-        ctx->fd = -1;
-        return -1;
-    }
-    return 0;
-}
-
-static void diagchar_close(diag_ctx_t *ctx) {
-    if (ctx && ctx->fd >= 0) {
-        close(ctx->fd);
-        ctx->fd = -1;
+static void install_sigalrm_handler(void) {
+    if (g_alarm_installed) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigalrm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* 禁用 SA_RESTART，确保阻塞在 diagchar_read 的 read() 立即被 EINTR 打断 */
+    if (sigaction(SIGALRM, &sa, NULL) == 0) {
+        g_alarm_installed = 1;
     }
 }
 
-/* 向 /dev/diag 目标基带通道收发单条同步 Diag 指令 */
-static int diagchar_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
-                             uint8_t *rsp_out, int rsp_cap, int timeout_ms) {
-    uint8_t send_buf[4096];
-    uint8_t payload[4096];
-    int pay_len = build_hdlc(cmd, cmd_len, payload, sizeof(payload));
-    if (pay_len < 0 || 8 + pay_len > (int)sizeof(send_buf)) return -1;
+static void set_cmd_timeout_sec(int sec) {
+    g_io_timed_out = 0;
+    g_cmd_timed_out = 0;
+    g_saw_diag_timeout = 0;
+    g_efs_write_critical = 0;
+    g_cmd_deadline_ms = (sec > 0) ? (diag_now_ms() + (long)sec * 1000L) : 0L;
+}
 
-    uint32_t dt = USER_SPACE_DATA_TYPE;
-    int32_t tok = ctx->token;
-    memcpy(send_buf, &dt, 4);
-    memcpy(send_buf + 4, &tok, 4);
-    memcpy(send_buf + 8, payload, (size_t)pay_len);
-
-    if (write(ctx->fd, send_buf, (size_t)(8 + pay_len)) < 0) {
-        fprintf(stderr, "diag write failed: errno=%d (%s)\n", errno, strerror(errno));
-        return -1;
-    }
-
-    static uint8_t rbuf[65536];
-    static uint8_t acc[65536];
-    int acc_len = 0;
-    struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN };
-
-    for (int tries = 0; tries < 20; tries++) {
-        int pr = poll(&pfd, 1, timeout_ms);
-        if (pr <= 0) break;
-        ssize_t n = read(ctx->fd, rbuf, sizeof(rbuf));
-        if (n < 8) continue;
-
-        uint32_t r_dt = 0;
-        int32_t num_pkts = 0;
-        memcpy(&r_dt, rbuf, 4);
-        memcpy(&num_pkts, rbuf + 4, 4);
-        if (r_dt != USER_SPACE_DATA_TYPE || num_pkts <= 0) continue;
-
-        int off = 8;
-        for (int p = 0; p < num_pkts && off + 8 <= n; p++) {
-            int32_t pkt_tok = 0;
-            uint32_t pkt_len = 0;
-            memcpy(&pkt_tok, rbuf + off, 4);
-            memcpy(&pkt_len, rbuf + off + 4, 4);
-            off += 8;
-            if (off + (int)pkt_len > n) break;
-
-            if (pkt_tok == ctx->token) {
-                if (acc_len + (int)pkt_len > (int)sizeof(acc)) acc_len = 0;
-                memcpy(acc + acc_len, rbuf + off, pkt_len);
-                acc_len += (int)pkt_len;
-
-                int start = 0;
-                for (int i = 0; i < acc_len; i++) {
-                    if (acc[i] == 0x7E) {
-                        if (i > start) {
-                            static uint8_t cand[8192];
-                            int clen = unwrap_one_hdlc_with_crc(acc + start, i - start, cand, sizeof(cand));
-                            int is_err = 0;
-                            if (clen > 0 && match_response(cmd, cmd_len, cand, clen, &is_err)) {
-                                if (is_err) return -1;
-                                int copy_n = clen < rsp_cap ? clen : rsp_cap;
-                                memcpy(rsp_out, cand, (size_t)copy_n);
-                                return copy_n;
-                            }
-                        }
-                        start = i + 1;
-                    }
-                }
-                if (start > 0 && start <= acc_len) {
-                    memmove(acc, acc + start, (size_t)(acc_len - start));
-                    acc_len -= start;
-                }
-            }
-            off += (int)pkt_len;
+static int compute_effective_timeout_ms(int req_timeout_ms) {
+    if (req_timeout_ms <= 0) req_timeout_ms = 1;
+    if (g_cmd_deadline_ms > 0L && !g_efs_write_critical) {
+        long rem = g_cmd_deadline_ms - diag_now_ms();
+        if (rem <= 0) {
+            g_cmd_timed_out = 1;
+            return 0;
+        }
+        if (rem < (long)req_timeout_ms) {
+            return (int)rem;
         }
     }
-    return -1;
+    return req_timeout_ms;
 }
 
-/* ===================== GKI diag-router SOCK_SEQPACKET 后端 ===================== */
+/* 带硬超时保护的 read()：同时打断无 .poll 回调的阻塞式 diagchar_read 并返回 -2 */
+static ssize_t diag_read_with_alarm(int fd, void *buf, size_t cap, int timeout_ms) {
+    int eff_ms = compute_effective_timeout_ms(timeout_ms);
+    if (eff_ms <= 0) return -2;
 
-/* 构造 diag-router 的 DIAG_IOCTL_SWITCH_LOGGING (data_type=7) 32 字节请求帧（末尾含 4B PID） */
-static void diag_router_build_switch_logging_req(uint32_t req_mode, int is_remote,
-                                                 int32_t pid, uint8_t out[32]) {
-    memset(out, 0, 32);
-    uint32_t dt = DIAG_IOCTL_SWITCH_LOGGING;
-    struct diag_logging_mode_param_t mode;
-    memset(&mode, 0, sizeof(mode));
-    mode.req_mode = req_mode;
-    mode.peripheral_mask = 0xFFF;
-    mode.pd_mask = 0;
-    mode.mode_param = 1;
-    mode.diag_id = -22;
-    mode.pd_val = diag_compute_pd_val(is_remote);
+    install_sigalrm_handler();
+    g_io_timed_out = 0;
 
-    int32_t eff_pid = (pid >= 1) ? pid : 1;
-    memcpy(out, &dt, 4);
-    memcpy(out + 4, &mode, sizeof(mode));
-    memcpy(out + 28, &eff_pid, 4);
+    struct itimerval itv;
+    memset(&itv, 0, sizeof(itv));
+    itv.it_value.tv_sec = eff_ms / 1000;
+    itv.it_value.tv_usec = (eff_ms % 1000) * 1000;
+    if (itv.it_value.tv_sec == 0 && itv.it_value.tv_usec == 0) {
+        itv.it_value.tv_usec = 1000;
+    }
+    itv.it_interval.tv_usec = 200000; /* 兜底间隔：防止信号恰在进入 read() 前触发造成挂起 */
+    setitimer(ITIMER_REAL, &itv, NULL);
+
+    ssize_t n = -1;
+    int saved_errno = 0;
+    for (;;) {
+        if (g_io_timed_out) {
+            n = -1;
+            saved_errno = EINTR;
+            break;
+        }
+        n = read(fd, buf, cap);
+        saved_errno = errno;
+        if (n >= 0 || saved_errno != EINTR || g_io_timed_out) {
+            break;
+        }
+    }
+
+    struct itimerval zero_itv;
+    memset(&zero_itv, 0, sizeof(zero_itv));
+    setitimer(ITIMER_REAL, &zero_itv, NULL);
+
+    /* 仅当 read() 确因信号中断返回 -1 (EINTR) 且闹钟已触发时判为超时，正常 EOF (n==0) 原样返回 */
+    if (n < 0 && saved_errno == EINTR && g_io_timed_out) {
+        if (g_cmd_deadline_ms > 0L && !g_efs_write_critical && diag_now_ms() >= g_cmd_deadline_ms) {
+            g_cmd_timed_out = 1;
+        }
+        errno = ETIMEDOUT;
+        return -2;
+    }
+    errno = saved_errno;
+    return n;
 }
 
-/* 构造发往 diag-router 的 USER_SPACE_DATA_TYPE (0x20) 请求包：
+/* 构造 USER_SPACE_DATA_TYPE (0x20) 公共 TX 帧（diagchar 与 diag-router 共用）：
  * 内置 MPSS (is_remote=0) 为 [0x20][HDLC]（严禁插入 4B token=0）；
  * 外挂 MDM (is_remote=1) 为 [0x20][token=-1][HDLC]。 */
-static int diag_router_build_tx_pkt(int is_remote, int32_t token,
-                                    const uint8_t *cmd, int cmd_len,
-                                    uint8_t *out, int out_cap) {
+static int diag_build_tx_pkt(int is_remote, int32_t token,
+                             const uint8_t *cmd, int cmd_len,
+                             uint8_t *out, int out_cap) {
     uint8_t payload[4096];
     int pay_len = build_hdlc(cmd, cmd_len, payload, (int)sizeof(payload));
     if (pay_len < 0) return -1;
@@ -435,20 +404,22 @@ static int diag_router_build_tx_pkt(int is_remote, int32_t token,
     return hdr_len + pay_len;
 }
 
-/* 解析 diag-router 返回的单条 SEQPACKET 数据报：
- * 返回 >0 为匹配的响应净荷长度，0 表示广播/未匹配包或分片待续，-1 表示匹配的 Diag 错误响应。 */
-static int diag_router_parse_rx_pkt(int is_remote, int32_t expected_token,
-                                    const uint8_t *rbuf, int n,
-                                    const uint8_t *cmd, int cmd_len,
-                                    uint8_t *acc, int *acc_len, int acc_cap,
-                                    uint8_t *rsp_out, int rsp_cap) {
+/* 解析 USER_SPACE_DATA_TYPE (0x20) 公共 RX 批次包（diagchar 与 diag-router 共用）：
+ * 内置 MPSS (is_remote=0) 每条记录为 [u32 len][HDLC]；
+ * 外挂 MDM (is_remote=1) 每条记录为 [i32 token][u32 len][HDLC]。
+ * 返回 >0 为匹配响应长度，0 表示广播/未匹配包或分片待续，-1 表示匹配的 Diag 错误响应。 */
+static int diag_parse_rx_pkt(int is_remote, int32_t expected_token,
+                             const uint8_t *rbuf, int n,
+                             const uint8_t *cmd, int cmd_len,
+                             uint8_t *acc, int *acc_len, int acc_cap,
+                             uint8_t *rsp_out, int rsp_cap) {
     if (!rbuf || !acc || !acc_len || !rsp_out || n < 12) return 0;
 
     uint32_t r_dt = 0;
     uint32_t num_pkts = 0;
     memcpy(&r_dt, rbuf, 4);
     memcpy(&num_pkts, rbuf + 4, 4);
-    if (r_dt != USER_SPACE_DATA_TYPE || num_pkts == 0 || num_pkts > 64) {
+    if (r_dt != USER_SPACE_DATA_TYPE || num_pkts == 0 || num_pkts > 4096) {
         return 0;
     }
 
@@ -502,10 +473,243 @@ static int diag_router_parse_rx_pkt(int is_remote, int32_t expected_token,
     return 0;
 }
 
-static long diag_router_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+/* 根据命令行模式选项与远端掩码判断是否启用外挂基带 MDM1：
+ * 仅 bit0 (0x0001) 代表外挂主基带 MDM1；0x0002 等第二协处理器位不得误判为外挂基带。 */
+static int diag_resolve_is_remote(diag_mode_opt_t mode_opt, uint16_t remote_mask) {
+    if (mode_opt == DIAG_MODE_REMOTE) return 1;
+    if (mode_opt == DIAG_MODE_LOCAL) return 0;
+    return (remote_mask & DIAG_REMOTE_MDM1_BIT) ? 1 : 0;
+}
+
+/* 计算 device_mask / pd_val：仅激活本地 APSS/MPSS (1u) 或再叠加外挂 MDM1 (3u)，
+ * 绝不混入 0x0002 等无关远端掩码位。 */
+static uint32_t diag_compute_pd_val(int is_remote) {
+    return is_remote ? (1u | (DIAG_REMOTE_MDM1_BIT << 1)) : 1u;
+}
+
+/* 构造传统内核 diagchar 的 SWITCH_LOGGING 参数（兼容 Linux 4.14 偏移 13/14/16/20 布局） */
+static void diagchar_build_switch_logging_param(uint32_t req_mode, uint32_t peripheral_mask,
+                                                int is_remote,
+                                                struct diagchar_logging_mode_param_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->req_mode = req_mode;
+    out->peripheral_mask = peripheral_mask;
+    out->pd_mask = 0;
+    out->mode_param = 1;
+    out->diag_id = 0;
+    out->pd_val = 0;
+    out->peripheral = -22; /* -EINVAL：无 PD 映射需求 */
+    out->device_mask = (int32_t)diag_compute_pd_val(is_remote);
+}
+
+/* 无副作用轻量探测 /dev/diag 字符设备是否存在（不切换 logging mode） */
+static int diagchar_detect(void) {
+    struct stat st;
+    if (stat("/dev/diag", &st) != 0) return 0;
+    return S_ISCHR(st.st_mode) ? 1 : 0;
+}
+
+/* 校验内核 MPSS 会话当前占用 PID（兼容跨掩码占用探测）：
+ * 返回 0 表示归属当前进程或老内核不支持 ioctl(41)；1 表示驱动未建立本进程会话需回退；-1 表示被他进程占用。 */
+static int diagchar_verify_mpss_session(int fd, uint32_t req_mask) {
+    struct diag_query_pid_t q;
+    memset(&q, 0, sizeof(q));
+    q.peripheral_mask = req_mask;
+    q.pd_mask = 0;
+    q.pid = 0;
+    q.device_mask = 1;
+    if (ioctl(fd, DIAG_IOCTL_QUERY_MD_PID, &q) < 0) {
+        return 0; /* 旧内核未实现 DIAG_IOCTL_QUERY_MD_PID (41) 时保留兼容放行 */
+    }
+    int32_t self_pid = (int32_t)getpid();
+    if (q.pid == self_pid) {
+        return 0;
+    }
+    if (q.pid > 0) {
+        fprintf(stderr, "diagchar MPSS session busy (owner pid=%d)\n", q.pid);
+        return -1;
+    }
+
+    /* 内核要求查询掩码与建连掩码严格相等，补充探测常见全外设掩码是否已被 diag_mdlog 等进程占用 */
+    static const uint32_t probe_masks[] = {
+        DIAG_CON_MPSS, DIAG_CON_ALL, DIAG_CON_ALL_EXT, DIAG_CON_LEGACY_ALL
+    };
+    for (size_t i = 0; i < sizeof(probe_masks) / sizeof(probe_masks[0]); i++) {
+        if (probe_masks[i] == req_mask) continue;
+        memset(&q, 0, sizeof(q));
+        q.peripheral_mask = probe_masks[i];
+        q.device_mask = 1;
+        if (ioctl(fd, DIAG_IOCTL_QUERY_MD_PID, &q) >= 0 && q.pid > 0 && q.pid != self_pid) {
+            fprintf(stderr, "diagchar session busy (mask=0x%x, owner pid=%d)\n", probe_masks[i], q.pid);
+            return -1;
+        }
+    }
+    return 1;
+}
+
+/* 自动或按需开启 /dev/diag：内置 MPSS 默认使用 MEMORY_DEVICE_MODE + DIAG_CON_MPSS，并校验会话归属（保留旧内核与外挂 MDM 回退） */
+static int diagchar_open(diag_ctx_t *ctx, diag_mode_opt_t mode_opt) {
+    ctx->fd = -1;
+    ctx->token = 0;
+    ctx->remote_mask = 0;
+    ctx->is_remote = 0;
+
+    ctx->fd = open("/dev/diag", O_RDWR | O_CLOEXEC);
+    if (ctx->fd < 0) {
+        fprintf(stderr, "open(/dev/diag) failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    uint16_t remote_mask = 0;
+    if (ioctl(ctx->fd, DIAG_IOCTL_REMOTE_DEV, &remote_mask) < 0) {
+        remote_mask = 0;
+    }
+    ctx->remote_mask = remote_mask;
+    ctx->is_remote = diag_resolve_is_remote(mode_opt, remote_mask);
+    ctx->token = ctx->is_remote ? -1 : 0;
+
+    struct diagchar_logging_mode_param_t mode;
+    if (!ctx->is_remote) {
+        diagchar_build_switch_logging_param(MEMORY_DEVICE_MODE, DIAG_CON_MPSS, 0, &mode);
+        if (ioctl(ctx->fd, DIAG_IOCTL_SWITCH_LOGGING, &mode) >= 0) {
+            int vrc = diagchar_verify_mpss_session(ctx->fd, DIAG_CON_MPSS);
+            if (vrc == 0) return 0;
+            if (vrc < 0) {
+                close(ctx->fd);
+                ctx->fd = -1;
+                return -1;
+            }
+        }
+    }
+
+    /* 外挂 MDM 或不支持 MEMORY_DEVICE_MODE 的旧版内核，回退 REGISTER_CALLBACK + CALLBACK_MODE */
+    int client_id = 0;
+    ioctl(ctx->fd, DIAG_IOCTL_REGISTER_CALLBACK, &client_id);
+    uint32_t cb_mask = ctx->is_remote ? DIAG_CON_LEGACY_ALL : DIAG_CON_MPSS;
+    diagchar_build_switch_logging_param(CALLBACK_MODE, cb_mask, ctx->is_remote, &mode);
+    int sw_rc = ioctl(ctx->fd, DIAG_IOCTL_SWITCH_LOGGING, &mode);
+    if (sw_rc < 0 && !ctx->is_remote) {
+        cb_mask = DIAG_CON_ALL;
+        diagchar_build_switch_logging_param(CALLBACK_MODE, cb_mask, 0, &mode);
+        sw_rc = ioctl(ctx->fd, DIAG_IOCTL_SWITCH_LOGGING, &mode);
+    }
+    if (sw_rc < 0) {
+        fprintf(stderr, "ioctl(DIAG_IOCTL_SWITCH_LOGGING) failed: errno=%d (%s)\n", errno, strerror(errno));
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+    if (!ctx->is_remote && diagchar_verify_mpss_session(ctx->fd, cb_mask) < 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static void diagchar_close(diag_ctx_t *ctx) {
+    if (ctx && ctx->fd >= 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+}
+
+/* 向 /dev/diag 目标基带通道收发单条同步 Diag 指令（受 poll + SIGALRM 双重超时保护） */
+static int diagchar_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_len,
+                             uint8_t *rsp_out, int rsp_cap, int timeout_ms) {
+    uint8_t send_buf[4096];
+    int tx_len = diag_build_tx_pkt(ctx->is_remote, ctx->token,
+                                   cmd, cmd_len, send_buf, (int)sizeof(send_buf));
+    if (tx_len < 0) return -1;
+
+    if (write(ctx->fd, send_buf, (size_t)tx_len) != (ssize_t)tx_len) {
+        fprintf(stderr, "diag write failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    static uint8_t rbuf[65536];
+    static uint8_t acc[65536];
+    int acc_len = 0;
+    int eff_ms = compute_effective_timeout_ms(timeout_ms);
+    if (eff_ms <= 0) {
+        g_saw_diag_timeout = 1;
+        return -2;
+    }
+    long deadline = diag_now_ms() + (long)eff_ms;
+
+    for (;;) {
+        long rem = deadline - diag_now_ms();
+        if (rem <= 0) break;
+
+        struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, (int)rem);
+        if (pr == 0) break;
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+
+        rem = deadline - diag_now_ms();
+        if (rem <= 0) break;
+
+        ssize_t n = diag_read_with_alarm(ctx->fd, rbuf, sizeof(rbuf), (int)rem);
+        if (n == -2) {
+            g_saw_diag_timeout = 1;
+            return -2;
+        }
+        if (n <= 0) {
+            return -1;
+        }
+
+        int parsed = diag_parse_rx_pkt(ctx->is_remote, ctx->token, rbuf, (int)n,
+                                       cmd, cmd_len, acc, &acc_len, (int)sizeof(acc),
+                                       rsp_out, rsp_cap);
+        if (parsed != 0) return parsed;
+    }
+
+    if (g_cmd_deadline_ms > 0L && !g_efs_write_critical && diag_now_ms() >= g_cmd_deadline_ms) {
+        g_cmd_timed_out = 1;
+    }
+    g_saw_diag_timeout = 1;
+    return -2;
+}
+
+/* ===================== GKI diag-router SOCK_SEQPACKET 后端 ===================== */
+
+/* 构造 diag-router 的 DIAG_IOCTL_SWITCH_LOGGING (data_type=7) 32 字节请求帧（末尾含 4B PID） */
+static void diag_router_build_switch_logging_req(uint32_t req_mode, int is_remote,
+                                                 int32_t pid, uint8_t out[32]) {
+    memset(out, 0, 32);
+    uint32_t dt = DIAG_IOCTL_SWITCH_LOGGING;
+    struct diag_logging_mode_param_t mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.req_mode = req_mode;
+    mode.peripheral_mask = 0xFFF;
+    mode.pd_mask = 0;
+    mode.mode_param = 1;
+    mode.diag_id = -22;
+    mode.pd_val = diag_compute_pd_val(is_remote);
+
+    int32_t eff_pid = (pid >= 1) ? pid : 1;
+    memcpy(out, &dt, 4);
+    memcpy(out + 4, &mode, sizeof(mode));
+    memcpy(out + 28, &eff_pid, 4);
+}
+
+/* diag-router 协议编解码薄包装（直接复用公共帧编解码逻辑） */
+static int diag_router_build_tx_pkt(int is_remote, int32_t token,
+                                    const uint8_t *cmd, int cmd_len,
+                                    uint8_t *out, int out_cap) {
+    return diag_build_tx_pkt(is_remote, token, cmd, cmd_len, out, out_cap);
+}
+
+static int diag_router_parse_rx_pkt(int is_remote, int32_t expected_token,
+                                    const uint8_t *rbuf, int n,
+                                    const uint8_t *cmd, int cmd_len,
+                                    uint8_t *acc, int *acc_len, int acc_cap,
+                                    uint8_t *rsp_out, int rsp_cap) {
+    return diag_parse_rx_pkt(is_remote, expected_token, rbuf, n,
+                             cmd, cmd_len, acc, acc_len, acc_cap, rsp_out, rsp_cap);
 }
 
 /* 连接高通 GKI diag-router 抽象命名空间 UNIX SOCK_SEQPACKET 套接字 */
@@ -529,6 +733,11 @@ static int diag_router_connect_socket(int timeout_ms) {
     lens[2] = (socklen_t)sizeof(addrs[2]);
 
     for (int i = 0; i < 3; i++) {
+        int eff_ms = compute_effective_timeout_ms(timeout_ms);
+        if (eff_ms <= 0) {
+            g_saw_diag_timeout = 1;
+            return -1;
+        }
         int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
         if (fd < 0) return -1;
 
@@ -538,12 +747,15 @@ static int diag_router_connect_socket(int timeout_ms) {
         int rc = connect(fd, (const struct sockaddr *)&addrs[i], lens[i]);
         if (rc < 0 && (errno == EINPROGRESS || errno == EAGAIN)) {
             struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-            if (poll(&pfd, 1, timeout_ms) > 0) {
+            int pr = poll(&pfd, 1, eff_ms);
+            if (pr > 0) {
                 int so_err = 0;
                 socklen_t elen = sizeof(so_err);
                 if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &elen) == 0 && so_err == 0) {
                     rc = 0;
                 }
+            } else if (pr == 0) {
+                g_saw_diag_timeout = 1;
             }
         }
         if (rc == 0) {
@@ -559,20 +771,46 @@ static int diag_router_connect_socket(int timeout_ms) {
 #endif
 }
 
-/* 跳过 diag-router 建连广播帧并等待目标控制应答包 */
+/* 跳过 diag-router 建连广播帧并等待目标控制应答包（接入全局超时与 g_saw_diag_timeout） */
 static int diag_router_recv_ctrl(int fd, uint32_t expected_type,
                                  uint8_t *out, size_t min_len, size_t cap, int timeout_ms) {
+    int eff_ms = compute_effective_timeout_ms(timeout_ms);
+    if (eff_ms <= 0) {
+        g_saw_diag_timeout = 1;
+        return -1;
+    }
+
     uint8_t buf[16384];
-    long deadline = diag_router_now_ms() + timeout_ms;
+    long deadline = diag_now_ms() + eff_ms;
 
     for (;;) {
-        long rem = deadline - diag_router_now_ms();
-        if (rem <= 0) break;
+        long rem = deadline - diag_now_ms();
+        if (rem <= 0) {
+            g_saw_diag_timeout = 1;
+            break;
+        }
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         int pr = poll(&pfd, 1, (int)rem);
-        if (pr <= 0) break;
+        if (pr == 0) {
+            g_saw_diag_timeout = 1;
+            break;
+        }
+        if (pr < 0) {
+            if (errno == EINTR && !g_cmd_timed_out) continue;
+            break;
+        }
 
-        ssize_t n = read(fd, buf, sizeof(buf));
+        rem = deadline - diag_now_ms();
+        if (rem <= 0) {
+            g_saw_diag_timeout = 1;
+            break;
+        }
+
+        ssize_t n = diag_read_with_alarm(fd, buf, sizeof(buf), (int)rem);
+        if (n == -2) {
+            g_saw_diag_timeout = 1;
+            break;
+        }
         if (n <= 0) break;
         if ((size_t)n < min_len || (size_t)n < 4) continue;
 
@@ -583,6 +821,9 @@ static int diag_router_recv_ctrl(int fd, uint32_t expected_type,
             memcpy(out, buf, cp);
             return (int)cp;
         }
+    }
+    if (g_cmd_deadline_ms > 0L && !g_efs_write_critical && diag_now_ms() >= g_cmd_deadline_ms) {
+        g_cmd_timed_out = 1;
     }
     return -1;
 }
@@ -663,24 +904,45 @@ static int diag_router_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int c
     static uint8_t rbuf[65536];
     static uint8_t acc[65536];
     int acc_len = 0;
-    long deadline = diag_router_now_ms() + timeout_ms;
+    int eff_ms = compute_effective_timeout_ms(timeout_ms);
+    if (eff_ms <= 0) {
+        g_saw_diag_timeout = 1;
+        return -2;
+    }
+    long deadline = diag_now_ms() + (long)eff_ms;
 
     for (;;) {
-        long rem = deadline - diag_router_now_ms();
+        long rem = deadline - diag_now_ms();
         if (rem <= 0) break;
         struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN };
         int pr = poll(&pfd, 1, (int)rem);
-        if (pr <= 0) break;
+        if (pr == 0) break;
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
 
-        ssize_t n = read(ctx->fd, rbuf, sizeof(rbuf));
-        if (n <= 0) break;
+        rem = deadline - diag_now_ms();
+        if (rem <= 0) break;
+
+        ssize_t n = diag_read_with_alarm(ctx->fd, rbuf, sizeof(rbuf), (int)rem);
+        if (n == -2) {
+            g_saw_diag_timeout = 1;
+            return -2;
+        }
+        if (n <= 0) return -1;
 
         int parsed = diag_router_parse_rx_pkt(ctx->is_remote, ctx->token, rbuf, (int)n,
                                               cmd, cmd_len, acc, &acc_len, (int)sizeof(acc),
                                               rsp_out, rsp_cap);
         if (parsed != 0) return parsed;
     }
-    return -1;
+
+    if (g_cmd_deadline_ms > 0L && !g_efs_write_critical && diag_now_ms() >= g_cmd_deadline_ms) {
+        g_cmd_timed_out = 1;
+    }
+    g_saw_diag_timeout = 1;
+    return -2;
 }
 
 /* 关闭 diag-router 套接字：直接 close() 触发对端 Empty read (EOF)，
@@ -792,6 +1054,43 @@ static const diag_transport_ops_t *find_diag_backend_by_id(diag_backend_t id) {
     return NULL;
 }
 
+static const char *resolve_backend_conf_path(void) {
+    const char *env = getenv("VOWIFIX_BACKEND_CONF");
+    return (env && *env) ? env : DEFAULT_BACKEND_CONF;
+}
+
+/* 读取显式后端降级配置（支持 BACKEND=none|diagchar|diag-router|auto 或裸值），命中有效配置返回 1 */
+static int read_backend_conf_override(const char *path, diag_backend_t *out) {
+    if (!path || !out) return 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+
+    char line[256];
+    int found = 0;
+    while (fgets(line, (int)sizeof(line), fp) != NULL) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '#') continue;
+
+        char *end = p + strlen(p);
+        while (end > p && isspace((unsigned char)end[-1])) {
+            *--end = '\0';
+        }
+        if (strncmp(p, "BACKEND=", 8) == 0) {
+            p += 8;
+            while (*p && isspace((unsigned char)*p)) p++;
+        }
+        diag_backend_t parsed = DIAG_BACKEND_AUTO;
+        if (parse_diag_backend(p, &parsed) == 0) {
+            *out = parsed;
+            found = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
 /* 按优先级无副作用探测当前设备可用的 Diag 后端；若无可用通道返回 NULL */
 static const diag_transport_ops_t *resolve_diag_backend(diag_backend_t req) {
     if (req == DIAG_BACKEND_NONE) return NULL;
@@ -863,7 +1162,7 @@ static int send_efs_cmd(const diag_ctx_t *ctx, uint8_t subcmd, const uint8_t *bo
     cmd[2] = subcmd;
     cmd[3] = 0x00;
     if (body_len > 0) memcpy(cmd + 4, body, (size_t)body_len);
-    return diag_transact(ctx, cmd, 4 + body_len, rsp, rsp_cap, 1500);
+    return diag_transact(ctx, cmd, 4 + body_len, rsp, rsp_cap, 2000);
 }
 
 /* ===================== EFS2 文件读写、校验与同步层 ===================== */
@@ -950,7 +1249,9 @@ static int efs_read_all_mem(const diag_ctx_t *ctx, const char *efs_path, uint8_t
         offset += (uint32_t)bytes_read;
         if ((uint32_t)bytes_read < nbyte) break;
     }
-    send_efs_cmd(ctx, EFS2_DIAG_CLOSE, (const uint8_t *)&fd_efs, 4, rsp, sizeof(rsp));
+    if (read_ok || (!g_cmd_timed_out && !g_saw_diag_timeout)) {
+        send_efs_cmd(ctx, EFS2_DIAG_CLOSE, (const uint8_t *)&fd_efs, 4, rsp, sizeof(rsp));
+    }
     if (!read_ok) {
         free(buf);
         return -1;
@@ -976,6 +1277,13 @@ static int efs_write_and_verify(const diag_ctx_t *ctx, const char *efs_path, con
     int plen = (int)strlen(efs_path) + 1;
     if (8 + plen > (int)sizeof(body)) return -1;
 
+    int res = -1;
+    uint8_t *verify_buf = NULL;
+    size_t verify_len = 0;
+
+    /* 写入与校验临界区：禁用外层短时限中途打断，确保半截写入不会直接被中断 */
+    g_efs_write_critical = 1;
+
     int32_t oflag = EFS2_DIAG_OPEN_WRONLY_TRUNC;
     int32_t fmode = EFS2_DEFAULT_MODE;
     memcpy(body, &oflag, 4);
@@ -983,13 +1291,13 @@ static int efs_write_and_verify(const diag_ctx_t *ctx, const char *efs_path, con
     memcpy(body + 8, efs_path, (size_t)plen);
 
     int r = send_efs_cmd(ctx, EFS2_DIAG_OPEN, body, 8 + plen, rsp, sizeof(rsp));
-    if (r < 12) return -1;
+    if (r < 12) goto write_done;
     int32_t fd_efs = -1, diag_errno = -1;
     memcpy(&fd_efs, rsp + 4, 4);
     memcpy(&diag_errno, rsp + 8, 4);
     if (fd_efs < 0 || diag_errno != 0) {
         fprintf(stderr, "OPEN(%s, WRONLY|TRUNC) failed: fd=%d errno=%d\n", efs_path, fd_efs, diag_errno);
-        return -1;
+        goto write_done;
     }
 
     size_t offset = 0;
@@ -1023,26 +1331,27 @@ static int efs_write_and_verify(const diag_ctx_t *ctx, const char *efs_path, con
     int32_t c_errno = (cr >= 8) ? *(int32_t *)(rsp + 4) : -1;
     if (cr < 8 || c_errno != 0 || !write_ok) {
         fprintf(stderr, "WRITE/CLOSE(%s) failed\n", efs_path);
-        return -1;
+        goto write_done;
     }
 
     uint32_t st_mode = 0, st_size = 0;
     if (efs_stat(ctx, efs_path, &st_mode, &st_size) != 0 || (size_t)st_size != len) {
         fprintf(stderr, "VERIFY FAILED: STAT %s size=%u != expected=%zu\n", efs_path, st_size, len);
-        return -1;
+        goto write_done;
     }
 
-    uint8_t *verify_buf = NULL;
-    size_t verify_len = 0;
     if (efs_read_all_mem(ctx, efs_path, &verify_buf, &verify_len) != 0 || verify_len != len ||
         memcmp(verify_buf, data, len) != 0) {
         fprintf(stderr, "VERIFY FAILED: read-back mismatch on %s\n", efs_path);
-        free(verify_buf);
-        return -1;
+        goto write_done;
     }
-    free(verify_buf);
     printf("VERIFY PASSED: %s (%zu bytes)\n", efs_path, len);
-    return 0;
+    res = 0;
+
+write_done:
+    free(verify_buf);
+    g_efs_write_critical = 0;
+    return res;
 }
 
 /* 发起 EFS2_DIAG_SYNC_NO_WAIT 并等待 EFS_SYNC_COMPLETE=1 落盘 */
@@ -1053,14 +1362,17 @@ static int efs_sync(const diag_ctx_t *ctx) {
     body[2] = '/';
     body[3] = '\0';
 
+    int res = -1;
+    g_efs_write_critical = 1;
+
     int r = send_efs_cmd(ctx, EFS2_DIAG_SYNC_NO_WAIT, body, 4, rsp, sizeof(rsp));
-    if (r < 14) return -1;
+    if (r < 14) goto sync_done;
 
     uint32_t sync_token = 0;
     int32_t diag_errno = -1;
     memcpy(&sync_token, rsp + 6, 4);
     memcpy(&diag_errno, rsp + 10, 4);
-    if (diag_errno != 0) return -1;
+    if (diag_errno != 0) goto sync_done;
 
     for (int attempt = 1; attempt <= 30; attempt++) {
         usleep(500 * 1000);
@@ -1072,7 +1384,7 @@ static int efs_sync(const diag_ctx_t *ctx) {
         qbody[7] = '\0';
 
         r = send_efs_cmd(ctx, EFS2_DIAG_GET_SYNC_STATUS, qbody, 8, rsp, sizeof(rsp));
-        if (r < 11) return -1;
+        if (r < 11) goto sync_done;
 
         uint8_t sync_status = 0xFF;
         int32_t st_errno = -1;
@@ -1083,16 +1395,20 @@ static int efs_sync(const diag_ctx_t *ctx) {
             sync_status = rsp[10];
             memcpy(&st_errno, rsp + 11, 4);
         } else {
-            return -1;
+            goto sync_done;
         }
-        if (st_errno != 0) return -1;
+        if (st_errno != 0) goto sync_done;
         if (sync_status == 1) {
             printf("SYNC COMPLETE: EFS_SYNC_COMPLETE=1\n");
-            return 0;
+            res = 0;
+            goto sync_done;
         }
     }
     fprintf(stderr, "EFS sync timeout\n");
-    return -1;
+
+sync_done:
+    g_efs_write_critical = 0;
+    return res;
 }
 
 /* ===================== 非破坏性 INI 节级就地合并引擎 ===================== */
@@ -1742,8 +2058,9 @@ static int s2b_apply_static_fqdn_patch(const uint8_t *orig, size_t orig_len,
     return 0;
 }
 
-/* 对共享锁文件加阻塞互斥锁，保障与后台守护及 App 串行访问 /dev/diag 和 QMI 刷新 */
-static int acquire_diag_lock(const char *lock_path) {
+/* 对共享锁文件加互斥锁（支持限时非阻塞轮询，防止 CLI 直接调用在外部锁死时无限挂起） */
+static int acquire_diag_lock(const char *lock_path, int wait_timeout_ms, int *out_busy) {
+    if (out_busy) *out_busy = 0;
     const char *slash = strrchr(lock_path, '/');
     if (slash && slash > lock_path) {
         char dir[512];
@@ -1761,13 +2078,37 @@ static int acquire_diag_lock(const char *lock_path) {
         fprintf(stderr, "open(%s) failed: %s\n", lock_path, strerror(errno));
         return -1;
     }
-    while (flock(lfd, LOCK_EX) != 0) {
-        if (errno == EINTR) continue;
-        fprintf(stderr, "flock(%s) failed: %s\n", lock_path, strerror(errno));
-        close(lfd);
-        return -1;
+    if (wait_timeout_ms <= 0) {
+        while (flock(lfd, LOCK_EX) != 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "flock(%s) failed: %s\n", lock_path, strerror(errno));
+            close(lfd);
+            return -1;
+        }
+        return lfd;
     }
-    return lfd;
+
+    long deadline = diag_now_ms() + wait_timeout_ms;
+    for (;;) {
+        if (flock(lfd, LOCK_EX | LOCK_NB) == 0) {
+            return lfd;
+        }
+        if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) {
+            fprintf(stderr, "flock(%s) failed: %s\n", lock_path, strerror(errno));
+            close(lfd);
+            return -1;
+        }
+        long rem = deadline - diag_now_ms();
+        if (rem <= 0) {
+            printf("DIAG_LOCK_BUSY\n");
+            fprintf(stderr, "DIAG_LOCK_BUSY: lock %s busy after %dms\n", lock_path, wait_timeout_ms);
+            if (out_busy) *out_busy = 1;
+            close(lfd);
+            return -1;
+        }
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = (rem < 100 ? rem : 100) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
 }
 
 /* ===================== 本地自测单元（验证跨运营商合并逻辑） ===================== */
@@ -2877,7 +3218,137 @@ static int run_self_tests(void) {
         fprintf(stderr, "FAIL T12 nas serving_system not_reg: st=%d roam=%d plmn=%s\n", reg_st_t, roam_t, plmn_t); return 1;
     }
 
-    printf("SELF-TEST PASSED: all 12 INI/SE/S2B merge, diag-router/diagchar transport & QMI VS/NAS cases OK\n");
+    /* 用例 13：diagchar 内核 ABI 结构体大小/偏移、切换参数编码与 backend.conf 解析校验 */
+    if (sizeof(struct diagchar_logging_mode_param_t) != 24 ||
+        offsetof(struct diagchar_logging_mode_param_t, mode_param) != 12 ||
+        offsetof(struct diagchar_logging_mode_param_t, diag_id) != 13 ||
+        offsetof(struct diagchar_logging_mode_param_t, pd_val) != 14 ||
+        offsetof(struct diagchar_logging_mode_param_t, peripheral) != 16 ||
+        offsetof(struct diagchar_logging_mode_param_t, device_mask) != 20 ||
+        sizeof(struct diag_query_pid_t) != 16) {
+        fprintf(stderr, "FAIL T13 diagchar kernel ABI layout mismatch\n"); return 1;
+    }
+    struct diagchar_logging_mode_param_t kmode_loc, kmode_rem;
+    diagchar_build_switch_logging_param(MEMORY_DEVICE_MODE, DIAG_CON_MPSS, 0, &kmode_loc);
+    if (kmode_loc.req_mode != MEMORY_DEVICE_MODE ||
+        kmode_loc.peripheral_mask != DIAG_CON_MPSS ||
+        kmode_loc.pd_mask != 0 || kmode_loc.mode_param != 1 ||
+        kmode_loc.diag_id != 0 || kmode_loc.pd_val != 0 ||
+        kmode_loc.peripheral != -22 || kmode_loc.device_mask != 1) {
+        fprintf(stderr, "FAIL T13 diagchar local switch_logging param\n"); return 1;
+    }
+    diagchar_build_switch_logging_param(CALLBACK_MODE, 0xFFFU, 1, &kmode_rem);
+    if (kmode_rem.req_mode != CALLBACK_MODE ||
+        kmode_rem.peripheral_mask != 0xFFFU ||
+        kmode_rem.device_mask != 3) {
+        fprintf(stderr, "FAIL T13 diagchar remote switch_logging param\n"); return 1;
+    }
+
+    char conf_tmp[] = "/tmp/vowifix_bconf_XXXXXX";
+    int conf_fd = mkstemp(conf_tmp);
+    if (conf_fd < 0) { fprintf(stderr, "FAIL T13 mkstemp\n"); return 1; }
+    const char *conf_none = "# override for incompatible kernel\n  \nBACKEND=none\n";
+    if (write(conf_fd, conf_none, strlen(conf_none)) != (ssize_t)strlen(conf_none)) {
+        close(conf_fd); unlink(conf_tmp);
+        fprintf(stderr, "FAIL T13 write conf\n"); return 1;
+    }
+    close(conf_fd);
+    diag_backend_t conf_bk = DIAG_BACKEND_AUTO;
+    if (read_backend_conf_override(conf_tmp, &conf_bk) != 1 || conf_bk != DIAG_BACKEND_NONE) {
+        unlink(conf_tmp);
+        fprintf(stderr, "FAIL T13 parse BACKEND=none conf\n"); return 1;
+    }
+    unlink(conf_tmp);
+    if (read_backend_conf_override("/tmp/vowifix_nonexistent_conf_file", &conf_bk) != 0) {
+        fprintf(stderr, "FAIL T13 missing conf guard\n"); return 1;
+    }
+
+    /* 用例 14：SIGALRM 硬超时打断阻塞 read()（覆盖管道 read 与 diagchar_transact 端到端超时） */
+    int block_pipe[2] = { -1, -1 };
+    if (pipe(block_pipe) != 0) { fprintf(stderr, "FAIL T14 pipe\n"); return 1; }
+    set_cmd_timeout_sec(0);
+    long t_start = diag_now_ms();
+    uint8_t sink[32];
+    ssize_t pr_n = diag_read_with_alarm(block_pipe[0], sink, sizeof(sink), 120);
+    long t_cost = diag_now_ms() - t_start;
+    close(block_pipe[0]);
+    close(block_pipe[1]);
+    if (pr_n != -2 || !g_io_timed_out || t_cost > 1500) {
+        fprintf(stderr, "FAIL T14 pipe read alarm (n=%zd timed=%d cost=%ldms)\n",
+                pr_n, (int)g_io_timed_out, t_cost);
+        return 1;
+    }
+
+    int sv_block[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv_block) != 0) {
+        fprintf(stderr, "FAIL T14 socketpair\n"); return 1;
+    }
+    set_cmd_timeout_sec(1);
+    diag_ctx_t block_ctx;
+    memset(&block_ctx, 0, sizeof(block_ctx));
+    block_ctx.fd = sv_block[0];
+    block_ctx.is_remote = 0;
+    block_ctx.token = 0;
+    block_ctx.ops = &DIAGCHAR_OPS;
+    uint8_t probe_cmd = DIAG_EXT_BUILD_ID;
+    uint8_t probe_rsp[64];
+    long tx_start = diag_now_ms();
+    int tx_rc = diagchar_transact(&block_ctx, &probe_cmd, 1, probe_rsp, sizeof(probe_rsp), 150);
+    long tx_cost = diag_now_ms() - tx_start;
+    close(sv_block[0]);
+    close(sv_block[1]);
+    if (tx_rc != -2 || !g_saw_diag_timeout || tx_cost > 1500) {
+        fprintf(stderr, "FAIL T14 diagchar_transact timeout (rc=%d cost=%ldms)\n", tx_rc, tx_cost);
+        return 1;
+    }
+    set_cmd_timeout_sec(0);
+
+    /* 用例 15：纯 EOF 不误判超时、单包超时不提前熔断全局预算、以及 acquire_diag_lock 限时防死锁校验 */
+    int eof_pipe[2] = { -1, -1 };
+    if (pipe(eof_pipe) != 0) { fprintf(stderr, "FAIL T15 eof pipe\n"); return 1; }
+    close(eof_pipe[1]);
+    ssize_t eof_n = diag_read_with_alarm(eof_pipe[0], sink, sizeof(sink), 200);
+    close(eof_pipe[0]);
+    if (eof_n != 0) {
+        fprintf(stderr, "FAIL T15 expected pure EOF 0, got %zd\n", eof_n);
+        return 1;
+    }
+
+    int sv_budget[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv_budget) != 0) {
+        fprintf(stderr, "FAIL T15 budget socketpair\n"); return 1;
+    }
+    set_cmd_timeout_sec(10);
+    block_ctx.fd = sv_budget[0];
+    int b_rc = diagchar_transact(&block_ctx, &probe_cmd, 1, probe_rsp, sizeof(probe_rsp), 80);
+    close(sv_budget[0]);
+    close(sv_budget[1]);
+    if (b_rc != -2 || !g_saw_diag_timeout || g_cmd_timed_out != 0) {
+        fprintf(stderr, "FAIL T15 single packet timeout must not set g_cmd_timed_out (rc=%d cmd_to=%d)\n",
+                b_rc, (int)g_cmd_timed_out);
+        return 1;
+    }
+    set_cmd_timeout_sec(0);
+
+    char lck_tmp[] = "/tmp/vowifix_lck_XXXXXX";
+    int lck_holder = mkstemp(lck_tmp);
+    if (lck_holder < 0) { fprintf(stderr, "FAIL T15 mkstemp lock\n"); return 1; }
+    if (flock(lck_holder, LOCK_EX | LOCK_NB) != 0) {
+        close(lck_holder); unlink(lck_tmp);
+        fprintf(stderr, "FAIL T15 holder flock\n"); return 1;
+    }
+    int lck_busy = 0;
+    int lck_second = acquire_diag_lock(lck_tmp, 120, &lck_busy);
+    close(lck_holder);
+    unlink(lck_tmp);
+    if (lck_second != -1 || lck_busy != 1) {
+        if (lck_second >= 0) close(lck_second);
+        fprintf(stderr, "FAIL T15 acquire_diag_lock expected busy=-1/1, got fd=%d busy=%d\n",
+                lck_second, lck_busy);
+        return 1;
+    }
+
+    printf("SELF-TEST PASSED: all 15 INI/SE/S2B merge, diagchar ABI/SIGALRM/lock, diag-router & QMI VS/NAS cases OK\n");
     return 0;
 }
 
@@ -3096,6 +3567,8 @@ static int restore_one_target(const diag_ctx_t *ctx, const char *backup_dir,
 int main(int argc, char **argv) {
     int ils_only = 0;
     int no_lock = 0;
+    int backend_explicit = 0;
+    int timeout_sec = -1;
     diag_mode_opt_t mode_opt = DIAG_MODE_AUTO;
     diag_backend_t backend_opt = DIAG_BACKEND_AUTO;
     const char *backup_dir = DEFAULT_BACKUP_DIR;
@@ -3118,11 +3591,34 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Invalid --backend value: %s\n", argv[i] + 10);
                 return 2;
             }
+            backend_explicit = 1;
         } else if (strcmp(argv[i], "--backend") == 0) {
             if (i + 1 >= argc || parse_diag_backend(argv[i + 1], &backend_opt) != 0) {
                 fprintf(stderr, "Invalid or missing --backend argument\n");
                 return 2;
             }
+            backend_explicit = 1;
+            i++;
+        } else if (strncmp(argv[i], "--timeout=", 10) == 0) {
+            char *ep = NULL;
+            long tv = strtol(argv[i] + 10, &ep, 10);
+            if (!ep || ep == argv[i] + 10 || *ep != '\0' || tv < 0 || tv > 600) {
+                fprintf(stderr, "Invalid --timeout value: %s\n", argv[i] + 10);
+                return 2;
+            }
+            timeout_sec = (int)tv;
+        } else if (strcmp(argv[i], "--timeout") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing --timeout argument\n");
+                return 2;
+            }
+            char *ep = NULL;
+            long tv = strtol(argv[i + 1], &ep, 10);
+            if (!ep || ep == argv[i + 1] || *ep != '\0' || tv < 0 || tv > 600) {
+                fprintf(stderr, "Invalid --timeout value: %s\n", argv[i + 1]);
+                return 2;
+            }
+            timeout_sec = (int)tv;
             i++;
         } else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc) {
             backup_dir = argv[++i];
@@ -3133,12 +3629,16 @@ int main(int argc, char **argv) {
 
     if (pos_argc < 1) {
         fprintf(stderr,
-                "Usage: %s [--ils-only] [--no-lock] [--remote|--local] "
+                "Usage: %s [--ils-only] [--no-lock] [--remote|--local] [--timeout <sec>] "
                 "[--backend=auto|diagchar|diag-router|libdiag|none] [--backup-dir <dir>] "
                 "detect|probe|status [slot0|slot1|all]|patch [slot0|slot1|all]|restore [slot0|slot1|all]|"
                 "refresh [slot0|slot1|all] [cfg act]|cell-status [slot0|slot1|all]|stat <efs_path>|read <efs_path> <local_out>|--self-test\n",
                 argv[0]);
         return 2;
+    }
+
+    if (!backend_explicit) {
+        read_backend_conf_override(resolve_backend_conf_path(), &backend_opt);
     }
 
     const char *cmd = pos_args[0];
@@ -3150,11 +3650,15 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* 获取与守护进程和 App 共享的互斥锁，保障 Diag 通道与 QMI 刷新严格串行 */
+    /* 获取与守护进程和 App 共享的互斥锁（支持限时非阻塞轮询，防止 CLI 直接调用死等） */
     int lock_fd = -1;
     if (!no_lock) {
-        lock_fd = acquire_diag_lock(DEFAULT_LOCK_PATH);
-        if (lock_fd < 0) return 1;
+        int lock_wait_ms = (timeout_sec == 0) ? 0 : ((timeout_sec > 0 ? timeout_sec : 20) * 1000);
+        int lock_busy = 0;
+        lock_fd = acquire_diag_lock(DEFAULT_LOCK_PATH, lock_wait_ms, &lock_busy);
+        if (lock_fd < 0) {
+            return lock_busy ? EXIT_CODE_LOCK_BUSY : 1;
+        }
     }
 
     /* refresh 与 cell-status 均走纯内核 QRTR 通路，严禁打开 Diag 通道 */
@@ -3207,9 +3711,19 @@ int main(int argc, char **argv) {
         ? (sizeof(ILS_ONLY_PATCHES) / sizeof(ILS_ONLY_PATCHES[0]))
         : (sizeof(UNIVERSAL_PATCHES) / sizeof(UNIVERSAL_PATCHES[0]));
 
+    int is_write_cmd = (strcmp(cmd, "patch") == 0 || strcmp(cmd, "restore") == 0);
+    int eff_timeout_sec = (timeout_sec >= 0)
+        ? timeout_sec
+        : (is_write_cmd ? DEFAULT_WRITE_TIMEOUT_SEC : DEFAULT_READ_TIMEOUT_SEC);
+    set_cmd_timeout_sec(eff_timeout_sec);
+
     diag_ctx_t ctx;
     if (diag_open(&ctx, backend_opt, mode_opt) != 0) {
         if (lock_fd >= 0) close(lock_fd);
+        if (g_cmd_timed_out || g_saw_diag_timeout) {
+            fprintf(stderr, "DIAG_READ_TIMEOUT: open exceeded timeout limit (%ds)\n", eff_timeout_sec);
+            return EXIT_CODE_TIMEOUT;
+        }
         return 1;
     }
 
@@ -3218,6 +3732,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "probe") == 0) {
         uint8_t rsp[512], ext_id = DIAG_EXT_BUILD_ID;
         int r = diag_transact(&ctx, &ext_id, 1, rsp, sizeof(rsp), 1500);
+        if (r == -2 || g_saw_diag_timeout) g_cmd_timed_out = 1;
         printf("backend=%s mode=%s remote_mask=0x%04x ext_build_id_len=%d sw=%s\n",
                ctx.ops ? ctx.ops->name : "unknown",
                ctx.is_remote ? "remote_mdm" : "local_mpss",
@@ -3262,6 +3777,7 @@ int main(int argc, char **argv) {
             } else if (rr != 0) {
                 printf("%s (%s): READ_ERROR\n", slots[i].slot_name, slots[i].efs_path);
                 rc = 1;
+                if (g_cmd_timed_out) break;
                 continue;
             }
             int patched = ini_check_patched(buf, blen, entries, nentries);
@@ -3279,6 +3795,9 @@ int main(int argc, char **argv) {
             } else if (sr != 0 || se_len < 16) {
                 printf("%s (%s): READ_ERROR\n", slots[i].se_backup_prefix, slots[i].se_path);
                 rc = 1;
+                free(se_buf);
+                if (g_cmd_timed_out) break;
+                continue;
             } else {
                 int se_need = se_needs_patch(se_buf, se_len);
                 printf("%s (%s): size=%zu wfc=0x%02x pref=0x%02x roam=0x%02x status=%s\n",
@@ -3297,6 +3816,9 @@ int main(int argc, char **argv) {
             } else if (s2r != 0) {
                 printf("%s (%s): READ_ERROR\n", slots[i].s2b_backup_prefix, slots[i].s2b_path);
                 rc = 1;
+                free(s2b_buf);
+                if (g_cmd_timed_out) break;
+                continue;
             } else {
                 char fqdn[128];
                 s2b_fqdn_state_t st = s2b_inspect_static_fqdn(s2b_buf, s2b_len, fqdn, sizeof(fqdn));
@@ -3324,15 +3846,19 @@ int main(int argc, char **argv) {
                                                entries, nentries, &changed);
             if (ini_res < 0) {
                 rc = 1;
+                if (g_cmd_timed_out) break;
+                continue;
             }
             if (ini_res == 1) {
                 continue;
             }
             if (patch_one_se_target(&ctx, &slots[i], backup_dir, &changed) != 0) {
                 rc = 1;
+                if (g_cmd_timed_out) break;
             }
             if (patch_one_s2b_target(&ctx, &slots[i], backup_dir, &changed) != 0) {
                 rc = 1;
+                if (g_cmd_timed_out) break;
             }
         }
 
@@ -3352,12 +3878,15 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < scnt; i++) {
             if (restore_one_target(&ctx, backup_dir, slots[i].slot_name, slots[i].efs_path, &changed) != 0) {
                 rc = 1;
+                if (g_cmd_timed_out) break;
             }
             if (restore_one_target(&ctx, backup_dir, slots[i].se_backup_prefix, slots[i].se_path, &changed) != 0) {
                 rc = 1;
+                if (g_cmd_timed_out) break;
             }
             if (restore_one_target(&ctx, backup_dir, slots[i].s2b_backup_prefix, slots[i].s2b_path, &changed) != 0) {
                 rc = 1;
+                if (g_cmd_timed_out) break;
             }
         }
         if (changed > 0) {
@@ -3373,5 +3902,9 @@ int main(int argc, char **argv) {
 out:
     diag_close(&ctx);
     if (lock_fd >= 0) close(lock_fd);
+    if (g_cmd_timed_out || (rc != 0 && g_saw_diag_timeout)) {
+        fprintf(stderr, "DIAG_READ_TIMEOUT: operation exceeded timeout limit (%ds)\n", eff_timeout_sec);
+        rc = EXIT_CODE_TIMEOUT;
+    }
     return rc;
 }

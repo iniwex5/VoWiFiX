@@ -1,7 +1,7 @@
 #!/system/bin/sh
 SKIPUNZIP=0
 
-ui_print "- Installing VoWiFiX v1.0.7 (by iniwex)"
+ui_print "- Installing VoWiFiX v1.0.8 (by iniwex)"
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/system/bin" 0 0 0755 0755
 set_perm "$MODPATH/service.sh" 0 0 0755
@@ -54,15 +54,17 @@ if [ "$BOOTMODE" = "true" ] || [ "$(getprop sys.boot_completed)" = "1" ]; then
           [ "$tries" -ge 20 ] && exit 99
           sleep 1
         done
-        OUT=$("$PATCHER" patch all --no-lock --backup-dir "$DATA_DIR" 2>&1)
-        RC=$?
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [install] RC=$RC | $(echo "$OUT" | tr '\n' '; ')" >> "$LOG_FILE"
-        printf '%s\n' "$OUT" > "$DATA_DIR/.install_out.tmp"
-        printf '%s' "$RC" > "$DATA_DIR/.install_rc.tmp"
-        if echo "$OUT" | grep -q "REBOOT_REQUIRED=1"; then
-          ui_print "- 正在等待 EFS 持久层缓冲落盘 (6s)..."
-          sleep 6
-        fi
+        (
+          OUT=$("$PATCHER" patch all --no-lock --timeout 30 --backup-dir "$DATA_DIR" 2>&1)
+          RC=$?
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [install] RC=$RC | $(echo "$OUT" | tr '\n' '; ')" >> "$LOG_FILE"
+          printf '%s\n' "$OUT" > "$DATA_DIR/.install_out.tmp"
+          printf '%s' "$RC" > "$DATA_DIR/.install_rc.tmp"
+          if echo "$OUT" | grep -q "REBOOT_REQUIRED=1"; then
+            ui_print "- 正在等待 EFS 持久层缓冲落盘 (6s)..."
+            sleep 6
+          fi
+        ) 8>&-
       ) 8>"$LOCK_FILE"
       OUT="$(cat "$DATA_DIR/.install_out.tmp" 2>/dev/null)"
       RC="$(cat "$DATA_DIR/.install_rc.tmp" 2>/dev/null)"

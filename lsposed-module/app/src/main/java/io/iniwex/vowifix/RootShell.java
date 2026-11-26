@@ -18,6 +18,8 @@ public final class RootShell {
     public static final String PID_PATH = DATA_DIR + "/watcher.pid";
     public static final String DISABLED_FLAG = DATA_DIR + "/watcher.disabled";
     public static final String MODULE_DIR = "/data/adb/modules/vowifix";
+    public static final String BACKEND_CONF_PATH = DATA_DIR + "/backend.conf";
+    public static final int EXIT_TIMEOUT = 124;
 
     public static final class Result {
         public final int exitCode;
@@ -113,7 +115,8 @@ public final class RootShell {
     }
 
     /**
-     * 使用 Toybox flock 的子 Shell 文件描述符重定向语法包裹临界区，保证与 service.sh 互斥。
+     * 使用 Toybox flock 的子 Shell 文件描述符重定向语法包裹临界区，保证与 service.sh 互斥；
+     * 内层子 Shell 显式执行 8>&- 关闭锁句柄继承，杜绝卡死在内核态的孙进程永久锁住 diag.lock。
      */
     public static String wrapWithDiagLock(String body) {
         return "mkdir -p '" + DATA_DIR + "' 2>/dev/null\n"
@@ -124,8 +127,26 @@ public final class RootShell {
                 + "    [ \"$tries\" -ge 20 ] && { echo 'DIAG_LOCK_BUSY'; exit 99; }\n"
                 + "    sleep 1\n"
                 + "  done\n"
+                + "  (\n"
                 + body + "\n"
+                + "  ) 8>&-\n"
                 + ") 8>'" + LOCK_PATH + "'\n";
+    }
+
+    /**
+     * 在 Root shell 内优先探测原生 /system/bin/timeout 参数兼容性（支持 -k 回退至无 -k），
+     * 避免被 Magisk Busybox 旧版 timeout 劫持报错，同时在超时后及时回收孤儿进程。
+     */
+    public static String wrapWithReadOnlyTimeout(String cmd, int timeoutSec) {
+        return "if [ -x /system/bin/timeout ] && /system/bin/timeout -k 1 1 /system/bin/true >/dev/null 2>&1; then\n"
+                + "  /system/bin/timeout -k 3 " + timeoutSec + " " + cmd + "\n"
+                + "elif [ -x /system/bin/timeout ] && /system/bin/timeout 1 /system/bin/true >/dev/null 2>&1; then\n"
+                + "  /system/bin/timeout " + timeoutSec + " " + cmd + "\n"
+                + "elif command -v toybox >/dev/null 2>&1 && toybox timeout -k 1 1 true >/dev/null 2>&1; then\n"
+                + "  toybox timeout -k 3 " + timeoutSec + " " + cmd + "\n"
+                + "else\n"
+                + "  " + cmd + "\n"
+                + "fi";
     }
 
     private static Thread startReaderThread(

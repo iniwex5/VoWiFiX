@@ -110,6 +110,8 @@ public final class TelephonyProbe {
 
     public static final class EfsSlotStatus {
         public static final String STATE_NO_DIAG = "NO_DIAG_BACKEND";
+        public static final String STATE_READ_TIMEOUT = "READ_TIMEOUT";
+        public static final String STATE_LOCK_BUSY = "LOCK_BUSY";
 
         public String iniState = "未读取";
         public String seState = "未读取";
@@ -129,6 +131,12 @@ public final class TelephonyProbe {
             if (STATE_NO_DIAG.equals(iniState)) {
                 return "配置合并: 未开放 Diag 通道 (仅上层模式)";
             }
+            if (STATE_LOCK_BUSY.equals(iniState)) {
+                return "配置合并: 守护正在操作中";
+            }
+            if (STATE_READ_TIMEOUT.equals(iniState)) {
+                return "配置合并: 读取超时";
+            }
             if ("ALREADY_PATCHED".equals(iniState)) {
                 return "配置合并: 已补丁" + (iniSize > 0 ? " (" + iniSize + " B)" : "");
             }
@@ -147,6 +155,12 @@ public final class TelephonyProbe {
         public String getSeSummaryText() {
             if (STATE_NO_DIAG.equals(seState)) {
                 return "漫游解锁: 由上层配置与原厂 MBN 接管";
+            }
+            if (STATE_LOCK_BUSY.equals(seState)) {
+                return "漫游解锁: 守护正在操作中";
+            }
+            if (STATE_READ_TIMEOUT.equals(seState)) {
+                return "漫游解锁: 读取超时";
             }
             if ("ALREADY_PATCHED".equals(seState)) {
                 return "漫游解锁: 已解锁" + (seDetail.isEmpty() ? "" : " (" + seDetail + ")");
@@ -487,15 +501,18 @@ public final class TelephonyProbe {
         }
 
         if (queryEfs && snap.binaryAvailable && snap.hasDiagBackend()) {
+            String readCmd = RootShell.wrapWithReadOnlyTimeout(
+                    "\"$BIN\" status all --no-lock --timeout 12 --backup-dir '" + RootShell.DATA_DIR + "' 2>&1",
+                    16);
             String diagCmd = RootShell.resolveBinarySnippet()
                     + "[ -n \"$BIN\" ] || exit 1\n"
-                    + RootShell.wrapWithDiagLock("\"$BIN\" status all --no-lock --backup-dir '" + RootShell.DATA_DIR + "' 2>&1");
-            RootShell.Result er = RootShell.execRoot(diagCmd, 25);
+                    + RootShell.wrapWithDiagLock(readCmd);
+            RootShell.Result er = RootShell.execRoot(diagCmd, 40);
             if (er.isSuccess()) {
                 parseEfsStatusOutput(er.stdout, snap.efs);
             } else {
                 String msg = er.stdout.isEmpty() ? er.stderr : er.stdout;
-                String label = msg.contains("DIAG_LOCK_BUSY") ? "守护正在操作中" : "读取失败";
+                String label = classifyEfsQueryError(er.exitCode, er.stdout, er.stderr);
                 snap.efs[0].iniState = label;
                 snap.efs[0].seState = label;
                 snap.efs[1].iniState = label;
@@ -506,6 +523,26 @@ public final class TelephonyProbe {
             }
         }
         return snap;
+    }
+
+    /**
+     * 区分 Diag 查询失败原因是锁忙（守护正在操作中）、读取超时还是通用读取错误。
+     */
+    static String classifyEfsQueryError(int exitCode, String stdout, String stderr) {
+        String out = stdout != null ? stdout : "";
+        String err = stderr != null ? stderr : "";
+        if (exitCode == 99 || out.contains("DIAG_LOCK_BUSY") || err.contains("DIAG_LOCK_BUSY")) {
+            return EfsSlotStatus.STATE_LOCK_BUSY;
+        }
+        if (exitCode == RootShell.EXIT_TIMEOUT
+                || exitCode == 137
+                || out.contains("DIAG_READ_TIMEOUT")
+                || err.contains("DIAG_READ_TIMEOUT")
+                || out.contains("命令执行超时")
+                || err.contains("命令执行超时")) {
+            return EfsSlotStatus.STATE_READ_TIMEOUT;
+        }
+        return "READ_ERROR";
     }
 
     static String parseMetaAndLog(String out, FullSnapshot snap) {

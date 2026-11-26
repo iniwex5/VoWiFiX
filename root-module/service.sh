@@ -334,8 +334,10 @@ apply_patch_and_refresh() {
                     [ "$tries" -ge 30 ] && exit 1
                     sleep 1
                 done
-                run_locked_qmi_refresh "$reason" "$hot_swap_target"
-                exit $?
+                (
+                    run_locked_qmi_refresh "$reason" "$hot_swap_target"
+                    exit $?
+                ) 8>&-
             ) 8>"$LOCK_FILE"
             TX_RC=$?
         else
@@ -353,49 +355,51 @@ apply_patch_and_refresh() {
                 sleep 1
             done
 
-            log_msg "INFO: [$reason] running vowifix-efs patch all (backend=$DIAG_BACKEND, bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
-            OUT=$("$BIN" patch all --no-lock --backup-dir "$DATA_DIR" 2>&1)
-            RC=$?
-            log_msg "RC=$RC | $(echo "$OUT" | tr '\n' '; ')"
+            (
+                log_msg "INFO: [$reason] running vowifix-efs patch all (backend=$DIAG_BACKEND, bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
+                OUT=$("$BIN" patch all --no-lock --timeout 30 --backup-dir "$DATA_DIR" 2>&1)
+                RC=$?
+                log_msg "RC=$RC | $(echo "$OUT" | tr '\n' '; ')"
 
-            normalize_siminfo_wfc_mode "$reason"
-            sync_cell_block_rules "$reason"
+                normalize_siminfo_wfc_mode "$reason"
+                sync_cell_block_rules "$reason"
 
-            [ "$RC" -ne 0 ] && exit 1
+                [ "$RC" -ne 0 ] && exit 1
 
-            if echo "$OUT" | grep -qE "CHANGED=[1-9]"; then
-                # 仅按实际被写入变更的卡槽选择性触发 QMI 热刷新，热插副卡时不打断主卡在线状态
-                CHG_S0=0
-                CHG_S1=0
-                printf '%s\n' "$OUT" | grep -qE "(/efsprofiles/overideconfig|/nv/item_files/ims/qp_ims_service_enablement_config|/data/iwlan_s2b_config\.xml) ->" && CHG_S0=1
-                printf '%s\n' "$OUT" | grep -q "_Subscription01 ->" && CHG_S1=1
-                if [ "$reason" = "sim_hot_swap" ]; then
-                    case "$hot_swap_target" in
-                        slot0) CHG_S0=1 ;;
-                        slot1) CHG_S1=1 ;;
-                        all) CHG_S0=1; CHG_S1=1 ;;
-                    esac
+                if echo "$OUT" | grep -qE "CHANGED=[1-9]"; then
+                    # 仅按实际被写入变更的卡槽选择性触发 QMI 热刷新，热插副卡时不打断主卡在线状态
+                    CHG_S0=0
+                    CHG_S1=0
+                    printf '%s\n' "$OUT" | grep -qE "(/efsprofiles/overideconfig|/nv/item_files/ims/qp_ims_service_enablement_config|/data/iwlan_s2b_config\.xml) ->" && CHG_S0=1
+                    printf '%s\n' "$OUT" | grep -q "_Subscription01 ->" && CHG_S1=1
+                    if [ "$reason" = "sim_hot_swap" ]; then
+                        case "$hot_swap_target" in
+                            slot0) CHG_S0=1 ;;
+                            slot1) CHG_S1=1 ;;
+                            all) CHG_S0=1; CHG_S1=1 ;;
+                        esac
+                    fi
+                    if [ "$CHG_S0" -eq 1 ] && [ "$CHG_S1" -eq 0 ]; then
+                        REFRESH_TARGET="slot0"
+                    elif [ "$CHG_S0" -eq 0 ] && [ "$CHG_S1" -eq 1 ]; then
+                        REFRESH_TARGET="slot1"
+                    else
+                        REFRESH_TARGET="all"
+                    fi
+
+                    # 规程 A：EFS_SYNC_COMPLETE=1 后至少静候 5 秒以上才能触发任何基带复位或刷新动作
+                    log_msg "INFO: [$reason] EFS updated (target=$REFRESH_TARGET), waiting 6s for persistent flush before QMI refresh..."
+                    sleep 6
+
+                    run_locked_qmi_refresh "$reason" "$REFRESH_TARGET"
+                    exit $?
+                elif [ "$reason" = "sim_hot_swap" ] && [ -n "$hot_swap_target" ]; then
+                    log_msg "INFO: [$reason] hot swap settled with CHANGED=0, checking QMI refresh for $hot_swap_target"
+                    run_locked_qmi_refresh "$reason" "$hot_swap_target"
+                    exit $?
                 fi
-                if [ "$CHG_S0" -eq 1 ] && [ "$CHG_S1" -eq 0 ]; then
-                    REFRESH_TARGET="slot0"
-                elif [ "$CHG_S0" -eq 0 ] && [ "$CHG_S1" -eq 1 ]; then
-                    REFRESH_TARGET="slot1"
-                else
-                    REFRESH_TARGET="all"
-                fi
-
-                # 规程 A：EFS_SYNC_COMPLETE=1 后至少静候 5 秒以上才能触发任何基带复位或刷新动作
-                log_msg "INFO: [$reason] EFS updated (target=$REFRESH_TARGET), waiting 6s for persistent flush before QMI refresh..."
-                sleep 6
-
-                run_locked_qmi_refresh "$reason" "$REFRESH_TARGET"
-                exit $?
-            elif [ "$reason" = "sim_hot_swap" ] && [ -n "$hot_swap_target" ]; then
-                log_msg "INFO: [$reason] hot swap settled with CHANGED=0, checking QMI refresh for $hot_swap_target"
-                run_locked_qmi_refresh "$reason" "$hot_swap_target"
-                exit $?
-            fi
-            exit 0
+                exit 0
+            ) 8>&-
         ) 8>"$LOCK_FILE"
         TX_RC=$?
     fi
@@ -436,17 +440,19 @@ apply_patch_and_refresh() {
                 [ "$tries" -ge 30 ] && exit 1
                 sleep 1
             done
-            ROUT=$("$BIN" refresh "$REFRESH_TARGET" --no-lock 2>&1)
-            RRC=$?
-            log_msg "INFO: [$reason] deferred refresh target=$REFRESH_TARGET RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
-            if [ "$RRC" -eq 0 ]; then
-                case "$REFRESH_TARGET" in
-                    slot0) exit 10 ;;
-                    slot1) exit 11 ;;
-                    *) exit 12 ;;
-                esac
-            fi
-            exit 1
+            (
+                ROUT=$("$BIN" refresh "$REFRESH_TARGET" --no-lock 2>&1)
+                RRC=$?
+                log_msg "INFO: [$reason] deferred refresh target=$REFRESH_TARGET RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
+                if [ "$RRC" -eq 0 ]; then
+                    case "$REFRESH_TARGET" in
+                        slot0) exit 10 ;;
+                        slot1) exit 11 ;;
+                        *) exit 12 ;;
+                    esac
+                fi
+                exit 1
+            ) 8>&-
         ) 8>"$LOCK_FILE"
         TX_RC=$?
     fi

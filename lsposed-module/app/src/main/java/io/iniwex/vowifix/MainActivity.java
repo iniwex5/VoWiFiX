@@ -242,7 +242,7 @@ public class MainActivity extends Activity {
         tvApp.setTypeface(Typeface.DEFAULT_BOLD);
         titleGroup.addView(tvApp);
 
-        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.7", palette.accent, palette.accentBg);
+        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.8", palette.accent, palette.accentBg);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         verLp.leftMargin = UiHelper.dp(this, 8);
@@ -745,10 +745,10 @@ public class MainActivity extends Activity {
     }
 
     private int resolveEfsLineColor(String state) {
-        if ("READ_ERROR".equals(state)) {
+        if ("READ_ERROR".equals(state) || TelephonyProbe.EfsSlotStatus.STATE_READ_TIMEOUT.equals(state)) {
             return palette.danger;
         }
-        if ("UNPATCHED".equals(state)) {
+        if ("UNPATCHED".equals(state) || TelephonyProbe.EfsSlotStatus.STATE_LOCK_BUSY.equals(state)) {
             return palette.warning;
         }
         if (TelephonyProbe.EfsSlotStatus.STATE_NO_DIAG.equals(state)) {
@@ -1100,7 +1100,7 @@ public class MainActivity extends Activity {
             if (hasDiag) {
                 inner = RootShell.resolveBinarySnippet()
                         + "[ -n \"$BIN\" ] || { echo 'ERR_NO_BIN'; exit 1; }\n"
-                        + "OUT=$(\"$BIN\" patch all --no-lock --backup-dir '" + RootShell.DATA_DIR + "' 2>&1)\n"
+                        + "OUT=$(\"$BIN\" patch all --no-lock --timeout 30 --backup-dir '" + RootShell.DATA_DIR + "' 2>&1)\n"
                         + "PRC=$?\n"
                         + "printf '%s\\n' \"$OUT\"\n"
                         + "SIM_OUT=$(\n"
@@ -1241,7 +1241,7 @@ public class MainActivity extends Activity {
                     + "DET=$(\"$BIN\" detect 2>/dev/null | head -n 1)\n"
                     + "BKD=\"${DET#BACKEND=}\"\n"
                     + "[ -n \"$BKD\" ] && [ \"$BKD\" != 'none' ] || { echo 'ERR_NO_DIAG'; exit 1; }\n"
-                    + "OUT=$(\"$BIN\" restore all --no-lock --backup-dir '" + RootShell.DATA_DIR + "' 2>&1)\n"
+                    + "OUT=$(\"$BIN\" restore all --no-lock --timeout 30 --backup-dir '" + RootShell.DATA_DIR + "' 2>&1)\n"
                     + "PRC=$?\n"
                     + "printf '%s\\n' \"$OUT\"\n"
                     + "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] restore RC=$PRC | $(echo \"$OUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
@@ -1304,6 +1304,21 @@ public class MainActivity extends Activity {
         if (r.stdout.contains("ERR_CALL_DURING_WAIT")) {
             setBusy(false, "落盘等待期间检测到通话，已暂缓触发热刷新");
             refreshStateAsync(false, true);
+            return;
+        }
+        if (r.exitCode == RootShell.EXIT_TIMEOUT
+                || r.stdout.contains("DIAG_READ_TIMEOUT")
+                || r.stderr.contains("DIAG_READ_TIMEOUT")) {
+            if (latestSnapshot != null) {
+                latestSnapshot.efs[0].iniState = TelephonyProbe.EfsSlotStatus.STATE_READ_TIMEOUT;
+                latestSnapshot.efs[0].seState = TelephonyProbe.EfsSlotStatus.STATE_READ_TIMEOUT;
+                latestSnapshot.efs[1].iniState = TelephonyProbe.EfsSlotStatus.STATE_READ_TIMEOUT;
+                latestSnapshot.efs[1].seState = TelephonyProbe.EfsSlotStatus.STATE_READ_TIMEOUT;
+            }
+            setBusy(false, actionName + "读取基带超时 (exit=" + r.exitCode
+                    + ")，已释放锁；如设备不兼容可将 BACKEND=none 写入 " + RootShell.BACKEND_CONF_PATH);
+            /* 避免刚发生 Diag 通道超时后又立刻自动发起一轮阻塞式 EFS 读取 */
+            refreshStateAsync(false, false, true);
             return;
         }
         if (!r.isSuccess()) {
