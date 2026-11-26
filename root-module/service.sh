@@ -76,6 +76,28 @@ is_sim_settled() {
     return 0
 }
 
+get_csv_part() {
+    raw="$1"
+    idx="$2"
+    [ -z "$raw" ] && return 0
+    if [ "$idx" -eq 0 ]; then
+        val="${raw%%,*}"
+    else
+        case "$raw" in
+            *,*) val="${raw#*,}"; val="${val%%,*}" ;;
+            *) val="" ;;
+        esac
+    fi
+    printf '%s' "$val" | tr -d ' \t\r\n'
+}
+
+get_slot_card_id() {
+    idx="$1"
+    st="$(get_csv_part "$(getprop gsm.sim.state)" "$idx")"
+    op="$(get_csv_part "$(getprop gsm.sim.operator.numeric)" "$idx")"
+    echo "${st}:${op}"
+}
+
 get_sim_sig() {
     echo "$(getprop gsm.sim.state)|$(getprop gsm.sim.operator.numeric)|$(getprop gsm.sim.operator.iso-country)"
 }
@@ -218,11 +240,68 @@ sync_cell_block_rules() {
     log_msg "INFO: [$reason] synced cell block rules (slot0=$SLOT0_BLOCK, slot1=$SLOT1_BLOCK, exempt_cn=$EXEMPT_CN_460)"
 }
 
-LAST_REFRESH_TS=0
+LAST_REFRESH_TS_S0=0
+LAST_REFRESH_TS_S1=0
 
-# 串行执行：等通话空闲 -> 持 shared flock -> 合并 EFS + 校准 siminfo + 同步禁蜂窝规则 -> 有写入则严格等 6s 落盘 -> QRTR 热刷新 -> 静候 20s 安全窗口
+# 读取目标卡槽最近一次 QMI 刷新时间戳（all 取两槽较新值）
+get_target_last_refresh_ts() {
+    case "$1" in
+        slot0) echo "$LAST_REFRESH_TS_S0" ;;
+        slot1) echo "$LAST_REFRESH_TS_S1" ;;
+        *)
+            if [ "$LAST_REFRESH_TS_S0" -ge "$LAST_REFRESH_TS_S1" ]; then
+                echo "$LAST_REFRESH_TS_S0"
+            else
+                echo "$LAST_REFRESH_TS_S1"
+            fi
+            ;;
+    esac
+}
+
+# 在持有 diag.lock 时按冷却与通话状态安全触发 QRTR QMI_VS 刷新：
+# 返回 10/11/12=已成功刷新(slot0/slot1/all)，20/21/22=通话中延后，30/31/32=冷却期释锁等待，1=刷新失败
+run_locked_qmi_refresh() {
+    r_reason="$1"
+    r_target="$2"
+
+    now_ts="$(date +%s)"
+    last_ts="$(get_target_last_refresh_ts "$r_target")"
+    elapsed_refresh=$((now_ts - last_ts))
+    if [ "$last_ts" -ne 0 ] && [ "$elapsed_refresh" -ge 0 ] && [ "$elapsed_refresh" -lt 45 ]; then
+        log_msg "INFO: [$r_reason] cooldown active for $r_target (${elapsed_refresh}s < 45s), deferring refresh outside lock"
+        case "$r_target" in
+            slot0) return 30 ;;
+            slot1) return 31 ;;
+            *) return 32 ;;
+        esac
+    fi
+
+    if is_call_active; then
+        log_msg "INFO: [$r_reason] call active before refresh, deferring refresh (target=$r_target)"
+        case "$r_target" in
+            slot0) return 20 ;;
+            slot1) return 21 ;;
+            *) return 22 ;;
+        esac
+    fi
+
+    ROUT=$("$BIN" refresh "$r_target" --no-lock 2>&1)
+    RRC=$?
+    log_msg "INFO: [$r_reason] refresh target=$r_target RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
+    if [ "$RRC" -eq 0 ]; then
+        case "$r_target" in
+            slot0) return 10 ;;
+            slot1) return 11 ;;
+            *) return 12 ;;
+        esac
+    fi
+    return 1
+}
+
+# 串行执行：等通话空闲 -> 持 shared flock -> 合并 EFS + 校准 siminfo + 同步禁蜂窝规则 -> 有写入等待 6s 落盘或热插拔 CHANGED=0 定向刷新 -> QRTR 热刷新 -> 静候 20s 安全窗口
 apply_patch_and_refresh() {
     reason="$1"
+    hot_swap_target="${2:-}"
 
     wait_call=0
     while is_call_active && [ "$wait_call" -lt 360 ]; do
@@ -238,88 +317,114 @@ apply_patch_and_refresh() {
     DIAG_BACKEND="${DETECT_LINE#BACKEND=}"
     [ -n "$DIAG_BACKEND" ] || DIAG_BACKEND="none"
 
+    did_refresh=0
+    REFRESH_TARGET="all"
+    TX_RC=0
+
     if [ "$DIAG_BACKEND" = "none" ]; then
         # 无可用 Diag 通道（如 GKI 新平台）时进入仅上层与 siminfo 校准模式，跳过 EFS 写入避免报错刷屏
         log_msg "INFO: [$reason] no diag backend available (GKI/upper-layer only mode), skipping EFS patch (bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
         normalize_siminfo_wfc_mode "$reason"
         sync_cell_block_rules "$reason"
-        return 0
+        if [ "$reason" = "sim_hot_swap" ] && [ -n "$hot_swap_target" ]; then
+            (
+                tries=0
+                while ! /system/bin/flock -n 8 2>/dev/null; do
+                    tries=$((tries + 1))
+                    [ "$tries" -ge 30 ] && exit 1
+                    sleep 1
+                done
+                run_locked_qmi_refresh "$reason" "$hot_swap_target"
+                exit $?
+            ) 8>"$LOCK_FILE"
+            TX_RC=$?
+        else
+            return 0
+        fi
+    else
+        (
+            tries=0
+            while ! /system/bin/flock -n 8 2>/dev/null; do
+                tries=$((tries + 1))
+                if [ "$tries" -ge 30 ]; then
+                    log_msg "WARN: [$reason] diag.lock busy timeout after 30s"
+                    exit 1
+                fi
+                sleep 1
+            done
+
+            log_msg "INFO: [$reason] running vowifix-efs patch all (backend=$DIAG_BACKEND, bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
+            OUT=$("$BIN" patch all --no-lock --backup-dir "$DATA_DIR" 2>&1)
+            RC=$?
+            log_msg "RC=$RC | $(echo "$OUT" | tr '\n' '; ')"
+
+            normalize_siminfo_wfc_mode "$reason"
+            sync_cell_block_rules "$reason"
+
+            [ "$RC" -ne 0 ] && exit 1
+
+            if echo "$OUT" | grep -qE "CHANGED=[1-9]"; then
+                # 仅按实际被写入变更的卡槽选择性触发 QMI 热刷新，热插副卡时不打断主卡在线状态
+                CHG_S0=0
+                CHG_S1=0
+                printf '%s\n' "$OUT" | grep -qE "(/efsprofiles/overideconfig|/nv/item_files/ims/qp_ims_service_enablement_config|/data/iwlan_s2b_config\.xml) ->" && CHG_S0=1
+                printf '%s\n' "$OUT" | grep -q "_Subscription01 ->" && CHG_S1=1
+                if [ "$reason" = "sim_hot_swap" ]; then
+                    case "$hot_swap_target" in
+                        slot0) CHG_S0=1 ;;
+                        slot1) CHG_S1=1 ;;
+                        all) CHG_S0=1; CHG_S1=1 ;;
+                    esac
+                fi
+                if [ "$CHG_S0" -eq 1 ] && [ "$CHG_S1" -eq 0 ]; then
+                    REFRESH_TARGET="slot0"
+                elif [ "$CHG_S0" -eq 0 ] && [ "$CHG_S1" -eq 1 ]; then
+                    REFRESH_TARGET="slot1"
+                else
+                    REFRESH_TARGET="all"
+                fi
+
+                # 规程 A：EFS_SYNC_COMPLETE=1 后至少静候 5 秒以上才能触发任何基带复位或刷新动作
+                log_msg "INFO: [$reason] EFS updated (target=$REFRESH_TARGET), waiting 6s for persistent flush before QMI refresh..."
+                sleep 6
+
+                run_locked_qmi_refresh "$reason" "$REFRESH_TARGET"
+                exit $?
+            elif [ "$reason" = "sim_hot_swap" ] && [ -n "$hot_swap_target" ]; then
+                log_msg "INFO: [$reason] hot swap settled with CHANGED=0, checking QMI refresh for $hot_swap_target"
+                run_locked_qmi_refresh "$reason" "$hot_swap_target"
+                exit $?
+            fi
+            exit 0
+        ) 8>"$LOCK_FILE"
+        TX_RC=$?
     fi
 
-    did_refresh=0
-    REFRESH_TARGET="all"
-    (
-        tries=0
-        while ! /system/bin/flock -n 8 2>/dev/null; do
-            tries=$((tries + 1))
-            if [ "$tries" -ge 30 ]; then
-                log_msg "WARN: [$reason] diag.lock busy timeout after 30s"
-                exit 1
-            fi
-            sleep 1
-        done
-
-        log_msg "INFO: [$reason] running vowifix-efs patch all (backend=$DIAG_BACKEND, bb=$(getprop gsm.version.baseband), sim=$(getprop gsm.sim.state), op=$(getprop gsm.sim.operator.numeric))"
-        OUT=$("$BIN" patch all --no-lock --backup-dir "$DATA_DIR" 2>&1)
-        RC=$?
-        log_msg "RC=$RC | $(echo "$OUT" | tr '\n' '; ')"
-
-        normalize_siminfo_wfc_mode "$reason"
-        sync_cell_block_rules "$reason"
-
-        [ "$RC" -ne 0 ] && exit 1
-
-        if echo "$OUT" | grep -qE "CHANGED=[1-9]"; then
-            # 仅按实际被写入变更的卡槽选择性触发 QMI 热刷新，热插副卡时不打断主卡在线状态
-            CHG_S0=0
-            CHG_S1=0
-            printf '%s\n' "$OUT" | grep -qE "(/efsprofiles/overideconfig|/nv/item_files/ims/qp_ims_service_enablement_config|/data/iwlan_s2b_config\.xml) ->" && CHG_S0=1
-            printf '%s\n' "$OUT" | grep -q "_Subscription01 ->" && CHG_S1=1
-            if [ "$CHG_S0" -eq 1 ] && [ "$CHG_S1" -eq 0 ]; then
-                REFRESH_TARGET="slot0"
-            elif [ "$CHG_S0" -eq 0 ] && [ "$CHG_S1" -eq 1 ]; then
-                REFRESH_TARGET="slot1"
-            else
-                REFRESH_TARGET="all"
-            fi
-
-            # 规程 A：EFS_SYNC_COMPLETE=1 后至少静候 5 秒以上才能触发任何基带复位或刷新动作
-            log_msg "INFO: [$reason] EFS updated (target=$REFRESH_TARGET), waiting 6s for persistent flush before QMI refresh..."
-            sleep 6
-
-            now_ts="$(date +%s)"
-            elapsed_refresh=$((now_ts - LAST_REFRESH_TS))
-            if [ "$LAST_REFRESH_TS" -ne 0 ] && [ "$elapsed_refresh" -lt 45 ]; then
-                log_msg "INFO: [$reason] refresh cooldown active (${elapsed_refresh}s < 45s), skipping extra refresh"
-                exit 0
-            fi
-
-            if is_call_active; then
-                log_msg "INFO: [$reason] call became active during flush window, deferring refresh (target=$REFRESH_TARGET)"
-                case "$REFRESH_TARGET" in
-                    slot0) exit 20 ;;
-                    slot1) exit 21 ;;
-                    *) exit 22 ;;
-                esac
-            fi
-
-            ROUT=$("$BIN" refresh "$REFRESH_TARGET" --no-lock 2>&1)
-            RRC=$?
-            log_msg "INFO: [$reason] refresh target=$REFRESH_TARGET RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
-            [ "$RRC" -eq 0 ] && exit 10
-            exit 1
-        fi
-        exit 0
-    ) 8>"$LOCK_FILE"
-    TX_RC=$?
-
+    NEED_COOLDOWN_WAIT=0
     case "$TX_RC" in
         20) REFRESH_TARGET="slot0"; TX_RC=2 ;;
         21) REFRESH_TARGET="slot1"; TX_RC=2 ;;
         22) REFRESH_TARGET="all"; TX_RC=2 ;;
+        30) REFRESH_TARGET="slot0"; NEED_COOLDOWN_WAIT=1; TX_RC=2 ;;
+        31) REFRESH_TARGET="slot1"; NEED_COOLDOWN_WAIT=1; TX_RC=2 ;;
+        32) REFRESH_TARGET="all"; NEED_COOLDOWN_WAIT=1; TX_RC=2 ;;
     esac
 
     if [ "$TX_RC" -eq 2 ]; then
+        if [ "$NEED_COOLDOWN_WAIT" -eq 1 ]; then
+            last_ts="$(get_target_last_refresh_ts "$REFRESH_TARGET")"
+            cw=0
+            while [ "$cw" -lt 45 ]; do
+                [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ] && return 0
+                now_ts="$(date +%s)"
+                elapsed_refresh=$((now_ts - last_ts))
+                if [ "$last_ts" -eq 0 ] || [ "$elapsed_refresh" -lt 0 ] || [ "$elapsed_refresh" -ge 45 ]; then
+                    break
+                fi
+                sleep 2
+                cw=$((cw + 2))
+            done
+        fi
         while is_call_active; do
             [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ] && return 0
             sleep 5
@@ -334,16 +439,34 @@ apply_patch_and_refresh() {
             ROUT=$("$BIN" refresh "$REFRESH_TARGET" --no-lock 2>&1)
             RRC=$?
             log_msg "INFO: [$reason] deferred refresh target=$REFRESH_TARGET RRC=$RRC | $(echo "$ROUT" | tr '\n' '; ')"
-            [ "$RRC" -eq 0 ] && exit 10
+            if [ "$RRC" -eq 0 ]; then
+                case "$REFRESH_TARGET" in
+                    slot0) exit 10 ;;
+                    slot1) exit 11 ;;
+                    *) exit 12 ;;
+                esac
+            fi
             exit 1
         ) 8>"$LOCK_FILE"
         TX_RC=$?
     fi
 
-    if [ "$TX_RC" -eq 10 ]; then
-        LAST_REFRESH_TS="$(date +%s)"
-        did_refresh=1
-    fi
+    case "$TX_RC" in
+        10)
+            LAST_REFRESH_TS_S0="$(date +%s)"
+            did_refresh=1
+            ;;
+        11)
+            LAST_REFRESH_TS_S1="$(date +%s)"
+            did_refresh=1
+            ;;
+        12)
+            now_ts="$(date +%s)"
+            LAST_REFRESH_TS_S0="$now_ts"
+            LAST_REFRESH_TS_S1="$now_ts"
+            did_refresh=1
+            ;;
+    esac
 
     if [ "$did_refresh" -eq 1 ]; then
         # 规程 B：基带刷新后等待 baseband 与 LOADED 恢复并再安静延迟 20 秒不碰 Diag 通道
@@ -380,16 +503,28 @@ done
 # 3. 遵循防 MHI/MCFG 竞态规程：确认基带就绪后再安静等待 15 秒
 sleep 15
 
+# 在执行 boot 补丁前先捕获稳态基线，避免执行与 20s 静候窗口内新热插卡被静默吞掉
+PREV_SIG="$(get_sim_sig)"
+PREV_CARD0="$(get_slot_card_id 0)"
+PREV_CARD1="$(get_slot_card_id 1)"
+
 if [ ! -f "$DISABLED_FLAG" ]; then
     apply_patch_and_refresh "boot"
 else
     log_msg "INFO: watcher paused via watcher.disabled, skipping boot auto-patch"
 fi
 
-PREV_SIG="$(get_sim_sig)"
 SAW_CHANGE=0
+SLOT0_DROPPED=0
+SLOT1_DROPPED=0
 WAS_DISABLED=0
 [ -f "$DISABLED_FLAG" ] && WAS_DISABLED=1
+
+# 锁存自上次稳态以来发生过离位/变更的卡槽，避免同卡在 8 秒防抖窗口内快速拔插后被稳态对比漏检
+mark_dropped_slots() {
+    [ "$(get_slot_card_id 0)" != "$PREV_CARD0" ] && SLOT0_DROPPED=1
+    [ "$(get_slot_card_id 1)" != "$PREV_CARD1" ] && SLOT1_DROPPED=1
+}
 
 # 4. 常驻后台监听热切卡/切换运营商（低功耗每 3 秒仅读内存属性）
 while true; do
@@ -407,7 +542,11 @@ while true; do
             WAS_DISABLED=1
         fi
         PREV_SIG="$(get_sim_sig)"
+        PREV_CARD0="$(get_slot_card_id 0)"
+        PREV_CARD1="$(get_slot_card_id 1)"
         SAW_CHANGE=0
+        SLOT0_DROPPED=0
+        SLOT1_DROPPED=0
         continue
     elif [ "$WAS_DISABLED" -eq 1 ]; then
         log_msg "INFO: background auto-patch resumed"
@@ -417,6 +556,7 @@ while true; do
     CUR_SIG="$(get_sim_sig)"
     if [ "$CUR_SIG" != "$PREV_SIG" ]; then
         SAW_CHANGE=1
+        mark_dropped_slots
         PREV_SIG="$CUR_SIG"
         continue
     fi
@@ -426,14 +566,47 @@ while true; do
         sleep 8
         SETTLED_SIG="$(get_sim_sig)"
         if [ "$SETTLED_SIG" != "$CUR_SIG" ]; then
+            mark_dropped_slots
             PREV_SIG="$SETTLED_SIG"
             continue
         fi
 
         if is_sim_settled; then
-            apply_patch_and_refresh "sim_hot_swap"
-            PREV_SIG="$(get_sim_sig)"
+            CUR_CARD0="$(get_slot_card_id 0)"
+            CUR_CARD1="$(get_slot_card_id 1)"
+            CHG0=0
+            CHG1=0
+            case "$CUR_CARD0" in
+                LOADED:*)
+                    if [ "$CUR_CARD0" != "$PREV_CARD0" ] || [ "$SLOT0_DROPPED" -eq 1 ]; then
+                        CHG0=1
+                    fi
+                    ;;
+            esac
+            case "$CUR_CARD1" in
+                LOADED:*)
+                    if [ "$CUR_CARD1" != "$PREV_CARD1" ] || [ "$SLOT1_DROPPED" -eq 1 ]; then
+                        CHG1=1
+                    fi
+                    ;;
+            esac
+            HOT_TARGET=""
+            if [ "$CHG0" -eq 1 ] && [ "$CHG1" -eq 1 ]; then
+                HOT_TARGET="all"
+            elif [ "$CHG0" -eq 1 ]; then
+                HOT_TARGET="slot0"
+            elif [ "$CHG1" -eq 1 ]; then
+                HOT_TARGET="slot1"
+            fi
+
+            apply_patch_and_refresh "sim_hot_swap" "$HOT_TARGET"
+            # 基线回退到本次已处理的稳态快照，确保执行耗时窗口内新变动卡能在下一轮被捕获
+            PREV_SIG="$CUR_SIG"
+            PREV_CARD0="$CUR_CARD0"
+            PREV_CARD1="$CUR_CARD1"
             SAW_CHANGE=0
+            SLOT0_DROPPED=0
+            SLOT1_DROPPED=0
         fi
     fi
 done

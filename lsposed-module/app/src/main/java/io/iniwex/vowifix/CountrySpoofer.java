@@ -1,7 +1,6 @@
 package io.iniwex.vowifix;
 
 import android.location.Address;
-import android.text.TextUtils;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -52,6 +51,7 @@ public final class CountrySpoofer {
     }
 
     private static final Map<String, GeoProfile> GEO_PROFILES;
+    private static final Map<String, String> MCC_ISO_FALLBACK;
 
     private static void addProfile(Map<String, GeoProfile> map, String iso, String countryName,
                                    String adminArea, String locality, String postalCode,
@@ -59,6 +59,12 @@ public final class CountrySpoofer {
                                    double lat, double lon, Locale locale) {
         map.put(iso, new GeoProfile(iso, countryName, adminArea, locality, postalCode,
                 thoroughfare, subThoroughfare, lat, lon, locale, true));
+    }
+
+    private static void addMccs(Map<String, String> map, String iso, String... mccs) {
+        for (String mcc : mccs) {
+            map.put(mcc, iso);
+        }
     }
 
     static {
@@ -117,6 +123,55 @@ public final class CountrySpoofer {
         addProfile(map, "za", "South Africa", "Gauteng", "Pretoria", "0001", "Government Ave", "1", -25.7406, 28.2116, new Locale("en", "ZA"));
 
         GEO_PROFILES = Collections.unmodifiableMap(map);
+
+        // 内置静态 ITU E.212 MCC -> ISO 兜底表，供无 MccTable 的进程（如 system_server）快速解析所在国
+        Map<String, String> mccMap = new HashMap<>();
+        addMccs(mccMap, "gb", "234", "235");
+        addMccs(mccMap, "ie", "272");
+        addMccs(mccMap, "fr", "208");
+        addMccs(mccMap, "de", "262");
+        addMccs(mccMap, "it", "222");
+        addMccs(mccMap, "es", "214");
+        addMccs(mccMap, "pt", "268");
+        addMccs(mccMap, "nl", "204");
+        addMccs(mccMap, "be", "206");
+        addMccs(mccMap, "ch", "228");
+        addMccs(mccMap, "at", "232");
+        addMccs(mccMap, "pl", "260");
+        addMccs(mccMap, "cz", "230");
+        addMccs(mccMap, "ro", "226");
+        addMccs(mccMap, "hu", "216");
+        addMccs(mccMap, "gr", "202");
+        addMccs(mccMap, "se", "240");
+        addMccs(mccMap, "no", "242");
+        addMccs(mccMap, "dk", "238");
+        addMccs(mccMap, "fi", "244");
+        addMccs(mccMap, "tr", "286");
+        addMccs(mccMap, "ru", "250");
+        addMccs(mccMap, "us", "310", "311", "312", "313", "314", "315", "316");
+        addMccs(mccMap, "ca", "302");
+        addMccs(mccMap, "mx", "334");
+        addMccs(mccMap, "br", "724");
+        addMccs(mccMap, "cn", "460", "461");
+        addMccs(mccMap, "hk", "454");
+        addMccs(mccMap, "mo", "455");
+        addMccs(mccMap, "tw", "466");
+        addMccs(mccMap, "jp", "440", "441");
+        addMccs(mccMap, "kr", "450");
+        addMccs(mccMap, "sg", "525");
+        addMccs(mccMap, "my", "502");
+        addMccs(mccMap, "th", "520");
+        addMccs(mccMap, "ph", "515");
+        addMccs(mccMap, "id", "510");
+        addMccs(mccMap, "vn", "452");
+        addMccs(mccMap, "in", "404", "405", "406");
+        addMccs(mccMap, "au", "505");
+        addMccs(mccMap, "nz", "530");
+        addMccs(mccMap, "ae", "424", "430", "431");
+        addMccs(mccMap, "sa", "420");
+        addMccs(mccMap, "il", "425");
+        addMccs(mccMap, "za", "655");
+        MCC_ISO_FALLBACK = Collections.unmodifiableMap(mccMap);
     }
 
     private CountrySpoofer() {
@@ -162,15 +217,19 @@ public final class CountrySpoofer {
                 && Character.isLetter(iso.charAt(1));
     }
 
+    private static boolean isEmptyStr(String s) {
+        return s == null || s.isEmpty();
+    }
+
     /**
      * 按卡槽索引切分逗号分隔的 Telephony 属性。
      */
     private static String getSlotPropPart(String propName, int slotIndex) {
-        if (slotIndex < 0) {
-            return null;
-        }
-        String raw = getSystemProperty(propName, "");
-        if (TextUtils.isEmpty(raw)) {
+        return getPartAt(getSystemProperty(propName, ""), slotIndex);
+    }
+
+    private static String getPartAt(String raw, int slotIndex) {
+        if (slotIndex < 0 || isEmptyStr(raw)) {
             return null;
         }
         String[] parts = raw.split(",", -1);
@@ -182,29 +241,66 @@ public final class CountrySpoofer {
     }
 
     /**
-     * 从 5~6 位全数字 PLMN 提取 3 位 MCC，无效返回 null。
+     * 判断指定网络制式是否代表真实有效的蜂窝无线驻网（排除 Unknown、空串与非蜂窝 IWLAN）。
+     */
+    public static boolean hasActiveCellularRadioTech(String netType) {
+        if (netType == null) {
+            return false;
+        }
+        String trimmed = netType.trim();
+        return !trimmed.isEmpty()
+                && !"UNKNOWN".equalsIgnoreCase(trimmed)
+                && !"IWLAN".equalsIgnoreCase(trimmed);
+    }
+
+    /**
+     * 判断指定物理卡槽当前是否处于有效蜂窝无线制式下。
+     */
+    public static boolean hasActiveCellularRadioTechForSlot(int slotIndex) {
+        return hasActiveCellularRadioTech(getSlotPropPart("gsm.network.type", slotIndex));
+    }
+
+    /**
+     * 校验 3 位 MCC（或 PLMN 前 3 位）是否属于 ITU E.212 有效国家号段（200~799），
+     * 用于过滤 000/001 等空网锁或无效占位 PLMN。
+     */
+    public static boolean isValidCountryMcc(String mccOrPlmn) {
+        if (mccOrPlmn == null || mccOrPlmn.length() < 3) {
+            return false;
+        }
+        char c0 = mccOrPlmn.charAt(0);
+        char c1 = mccOrPlmn.charAt(1);
+        char c2 = mccOrPlmn.charAt(2);
+        if (!Character.isDigit(c0) || !Character.isDigit(c1) || !Character.isDigit(c2)) {
+            return false;
+        }
+        int mcc = (c0 - '0') * 100 + (c1 - '0') * 10 + (c2 - '0');
+        return mcc >= 200 && mcc <= 799;
+    }
+
+    /**
+     * 通过内置静态映射表将 3 位 MCC（或 PLMN）兜底解析为小写 2 位 ISO 国家码，未命中返回空串。
+     */
+    public static String getFallbackIsoForMcc(String mccOrPlmn) {
+        if (!isValidCountryMcc(mccOrPlmn)) {
+            return "";
+        }
+        String iso = MCC_ISO_FALLBACK.get(mccOrPlmn.substring(0, 3));
+        return iso != null ? iso : "";
+    }
+
+    /**
+     * 从 5~6 位 PLMN 提取合法 ITU 国家 3 位 MCC（200~799），无效或测试空网返回 null。
      */
     private static String extractMcc(String plmn) {
-        if (plmn == null || plmn.length() < 3) {
+        if (!isValidCountryMcc(plmn)) {
             return null;
-        }
-        for (int i = 0; i < 3; i++) {
-            if (!Character.isDigit(plmn.charAt(i))) {
-                return null;
-            }
         }
         return plmn.substring(0, 3);
     }
 
-    /**
-     * 获取指定卡槽 SIM 卡声明的归属国 ISO（小写 2 位字母）。
-     */
-    public static String getTargetIsoForSlot(int slotIndex) {
-        String override = readOverrideIso();
-        if (override != null) {
-            return override;
-        }
-        String iso = getSlotPropPart("gsm.sim.operator.iso-country", slotIndex);
+    private static String extractIsoFromProp(String rawSimIsos, int slotIndex) {
+        String iso = getPartAt(rawSimIsos, slotIndex);
         if (iso != null) {
             String lower = iso.toLowerCase(Locale.US);
             if (isValidTwoLetterIso(lower)) {
@@ -215,62 +311,168 @@ public final class CountrySpoofer {
     }
 
     /**
+     * 判断是否设置了手动目标国家码覆盖文件。
+     */
+    public static boolean hasManualOverrideIso() {
+        return readOverrideIso() != null;
+    }
+
+    /**
+     * 获取指定卡槽 SIM 卡原生声明的归属国 ISO（小写 2 位字母，不受手动覆盖文件影响）。
+     */
+    public static String getNativeSimIsoForSlot(int slotIndex) {
+        return extractIsoFromProp(getSystemProperty("gsm.sim.operator.iso-country", ""), slotIndex);
+    }
+
+    /**
+     * 获取指定卡槽最终目标国家码 ISO（优先返回手动覆盖配置，其次回退 SIM 原生归属国）。
+     */
+    public static String getTargetIsoForSlot(int slotIndex) {
+        String override = readOverrideIso();
+        if (override != null) {
+            return override;
+        }
+        return getNativeSimIsoForSlot(slotIndex);
+    }
+
+    /**
      * 获取指定卡槽 SIM 卡声明的归属运营商名称（依次回退 gsm.sim.operator.alpha 与 numeric）。
      */
     public static String getHomeOperatorNameForSlot(int slotIndex) {
         String alpha = getSlotPropPart("gsm.sim.operator.alpha", slotIndex);
-        if (!TextUtils.isEmpty(alpha)) {
+        if (!isEmptyStr(alpha)) {
             return alpha;
         }
         String numeric = getSlotPropPart("gsm.sim.operator.numeric", slotIndex);
-        return !TextUtils.isEmpty(numeric) ? numeric : null;
+        return !isEmptyStr(numeric) ? numeric : null;
     }
 
     /**
-     * 判断指定卡槽是否处于“SIM 归属 MCC 与当前蜂窝驻网 MCC 不匹配”（跨国漫游）状态。
+     * 解析整机当前真实物理所在国 MCC：
+     * 优先采信具备有效蜂窝无线制式（非 Unknown/空/IWLAN）的槽位驻网 MCC；
+     * 若整机无有效蜂窝制式，则采信存在明确跨国漫游差异的驻网 MCC。
+     */
+    public static String resolvePhysicalDeviceMcc() {
+        return resolvePhysicalDeviceMcc(
+                getSystemProperty("gsm.sim.operator.numeric", ""),
+                getSystemProperty("gsm.operator.numeric", ""),
+                getSystemProperty("gsm.network.type", "")
+        );
+    }
+
+    static String resolvePhysicalDeviceMcc(String rawSimNumerics, String rawNetNumerics, String rawNetTypes) {
+        String[] simParts = isEmptyStr(rawSimNumerics) ? new String[0] : rawSimNumerics.split(",", -1);
+        String[] netParts = isEmptyStr(rawNetNumerics) ? new String[0] : rawNetNumerics.split(",", -1);
+        String[] typeParts = isEmptyStr(rawNetTypes) ? new String[0] : rawNetTypes.split(",", -1);
+        int count = Math.max(netParts.length, Math.max(simParts.length, typeParts.length));
+
+        // Tier 1：真实蜂窝无线制式下的驻网 MCC 作为最强物理所在国证据
+        for (int i = 0; i < count; i++) {
+            String netMcc = extractMcc(getPartAt(rawNetNumerics, i));
+            String netType = getPartAt(rawNetTypes, i);
+            if (netMcc != null && hasActiveCellularRadioTech(netType)) {
+                return netMcc;
+            }
+        }
+
+        // Tier 2：双卡均无有效蜂窝制式时，采信存在跨国漫游差异（netMcc != simMcc）的驻网 MCC
+        for (int i = 0; i < count; i++) {
+            String netMcc = extractMcc(getPartAt(rawNetNumerics, i));
+            String simMcc = extractMcc(getPartAt(rawSimNumerics, i));
+            if (netMcc != null && simMcc != null && !netMcc.equals(simMcc)) {
+                return netMcc;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 判断指定卡槽是否处于“跨国漫游/需归属国伪装”态，识破无蜂窝或 IWLAN 下的假归属 PLMN。
      */
     public static boolean isSlotRoamingMismatch(int slotIndex) {
-        if (readOverrideIso() != null) {
+        return isSlotRoamingMismatch(
+                slotIndex,
+                getSystemProperty("gsm.sim.operator.numeric", ""),
+                getSystemProperty("gsm.operator.numeric", ""),
+                getSystemProperty("gsm.network.type", ""),
+                getSystemProperty("gsm.sim.operator.iso-country", ""),
+                readOverrideIso()
+        );
+    }
+
+    static boolean isSlotRoamingMismatch(
+            int slotIndex,
+            String rawSimNumerics,
+            String rawNetNumerics,
+            String rawNetTypes,
+            String rawSimIsos,
+            String overrideIso) {
+        if (overrideIso != null) {
             return true;
         }
-        if (getTargetIsoForSlot(slotIndex) == null) {
+        if (extractIsoFromProp(rawSimIsos, slotIndex) == null) {
             return false;
         }
-        String simMcc = extractMcc(getSlotPropPart("gsm.sim.operator.numeric", slotIndex));
-        String netMcc = extractMcc(getSlotPropPart("gsm.operator.numeric", slotIndex));
+        String simMcc = extractMcc(getPartAt(rawSimNumerics, slotIndex));
+        String netMcc = extractMcc(getPartAt(rawNetNumerics, slotIndex));
+        String netType = getPartAt(rawNetTypes, slotIndex);
+
         if (simMcc != null && netMcc != null) {
-            return !simMcc.equals(netMcc);
+            if (!simMcc.equals(netMcc)) {
+                return true;
+            }
+            if (hasActiveCellularRadioTech(netType)) {
+                return false;
+            }
+        }
+
+        // 本槽无 netMcc 或仅在 Unknown/空/IWLAN 下出现同国假 PLMN 时，依赖全机真实物理 MCC 交叉校验
+        String physicalMcc = resolvePhysicalDeviceMcc(rawSimNumerics, rawNetNumerics, rawNetTypes);
+        if (physicalMcc != null && simMcc != null) {
+            return !simMcc.equals(physicalMcc);
         }
         return true;
     }
 
     /**
-     * 判断给定卡槽是否需要执行归属国欺骗（存在有效 SIM 归属国且跨国漫游/无驻网）。
+     * 判断给定卡槽是否需要执行归属国欺骗（存在有效 SIM 归属国且处于跨国漫游或无真实本地驻网）。
      */
     public static boolean shouldSpoofSlot(int slotIndex) {
         return getTargetIsoForSlot(slotIndex) != null && isSlotRoamingMismatch(slotIndex);
     }
 
     /**
-     * 获取全局默认目标国家码（兼容副卡无蜂窝驻网或飞行模式等跨国双卡场景）。
+     * 获取全局默认目标国家码（结合物理驻网 MCC 与有效蜂窝制式识别无蜂窝/被假 PLMN 污染的跨国卡）。
      */
     public static String getGlobalTargetIso() {
-        String override = readOverrideIso();
-        if (override != null) {
-            return override;
+        return getGlobalTargetIso(
+                getSystemProperty("gsm.sim.operator.numeric", ""),
+                getSystemProperty("gsm.operator.numeric", ""),
+                getSystemProperty("gsm.network.type", ""),
+                getSystemProperty("gsm.sim.operator.iso-country", ""),
+                readOverrideIso()
+        );
+    }
+
+    static String getGlobalTargetIso(
+            String rawSimNumerics,
+            String rawNetNumerics,
+            String rawNetTypes,
+            String rawSimIsos,
+            String overrideIso) {
+        if (overrideIso != null) {
+            return overrideIso;
         }
-        String rawIso = getSystemProperty("gsm.sim.operator.iso-country", "");
-        if (TextUtils.isEmpty(rawIso)) {
+        if (isEmptyStr(rawSimIsos)) {
             return null;
         }
-        String[] isoParts = rawIso.split(",", -1);
+        String[] isoParts = rawSimIsos.split(",", -1);
+        String physicalMcc = resolvePhysicalDeviceMcc(rawSimNumerics, rawNetNumerics, rawNetTypes);
+
         String firstFallbackIso = null;
         String nonCnFallbackIso = null;
-        String knownDeviceNetMcc = null;
-
-        // 第 1 遍：记录兜底归属国与设备已确认驻网 MCC，同时优先识别自包含跨国漫游的卡槽
         for (int i = 0; i < isoParts.length; i++) {
-            String iso = getTargetIsoForSlot(i);
+            String iso = extractIsoFromProp(rawSimIsos, i);
             if (iso == null) {
                 continue;
             }
@@ -280,37 +482,18 @@ public final class CountrySpoofer {
             if (nonCnFallbackIso == null && !"cn".equals(iso)) {
                 nonCnFallbackIso = iso;
             }
-            String simMcc = extractMcc(getSlotPropPart("gsm.sim.operator.numeric", i));
-            String netMcc = extractMcc(getSlotPropPart("gsm.operator.numeric", i));
-            if (netMcc != null) {
-                if (knownDeviceNetMcc == null) {
-                    knownDeviceNetMcc = netMcc;
-                }
-                if (simMcc != null && !simMcc.equals(netMcc)) {
+            if (physicalMcc != null) {
+                String simMcc = extractMcc(getPartAt(rawSimNumerics, i));
+                if (simMcc != null && !simMcc.equals(physicalMcc)) {
                     return iso;
                 }
             }
         }
 
-        // 第 2 遍：另一张卡已证实设备位于异国时，识别无蜂窝服务的海外跨国副卡；纯本土双卡返回 null
-        if (knownDeviceNetMcc != null) {
-            for (int i = 0; i < isoParts.length; i++) {
-                String iso = getTargetIsoForSlot(i);
-                if (iso == null) {
-                    continue;
-                }
-                String netMcc = extractMcc(getSlotPropPart("gsm.operator.numeric", i));
-                if (netMcc == null) {
-                    String simMcc = extractMcc(getSlotPropPart("gsm.sim.operator.numeric", i));
-                    if (simMcc != null && !simMcc.equals(knownDeviceNetMcc)) {
-                        return iso;
-                    }
-                }
-            }
+        if (physicalMcc != null) {
             return null;
         }
-
-        // 全双卡无蜂窝驻网或处于飞行模式时，优先返回首个非本土 CN 归属国
+        // 整机无可靠蜂窝驻网（飞行模式或全脱网）时，优先返回首个非本土 CN 归属国
         return nonCnFallbackIso != null ? nonCnFallbackIso : firstFallbackIso;
     }
 

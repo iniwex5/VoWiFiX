@@ -56,6 +56,10 @@ public final class TelephonyProbe {
             if (!isSimLoaded() || simNumeric.length() < 3 || netNumeric.length() < 3) {
                 return false;
             }
+            if (!CountrySpoofer.isValidCountryMcc(simNumeric)
+                    || !CountrySpoofer.isValidCountryMcc(netNumeric)) {
+                return false;
+            }
             return !simNumeric.substring(0, 3).equals(netNumeric.substring(0, 3));
         }
 
@@ -74,14 +78,19 @@ public final class TelephonyProbe {
         }
 
         public boolean hasCellularNetwork() {
-            return netNumeric.length() >= 3;
+            return CountrySpoofer.isValidCountryMcc(netNumeric)
+                    && (CountrySpoofer.hasActiveCellularRadioTech(netType) || isRoamingOnCellular());
         }
 
         public boolean isHomeCellular() {
             if (!isSimLoaded() || simNumeric.length() < 3 || netNumeric.length() < 3) {
                 return false;
             }
-            return simNumeric.substring(0, 3).equals(netNumeric.substring(0, 3));
+            if (!CountrySpoofer.isValidCountryMcc(netNumeric)) {
+                return false;
+            }
+            return CountrySpoofer.hasActiveCellularRadioTech(netType)
+                    && simNumeric.substring(0, 3).equals(netNumeric.substring(0, 3));
         }
 
         public boolean isIwlanOnly() {

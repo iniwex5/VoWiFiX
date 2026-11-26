@@ -35,6 +35,7 @@ public final class LocationGeoHook {
             hookLocaleTracker(lpparam);
             hookTelephonyCountryDetector(lpparam);
             hookPhoneInterfaceManager(lpparam);
+            hookNitzCountryGuard(lpparam);
         }
 
         if ("org.codeaurora.ims".equals(pkg)) {
@@ -105,20 +106,8 @@ public final class LocationGeoHook {
         return false;
     }
 
-    private static String extractMcc(String plmn) {
-        if (plmn == null || plmn.length() < 3) {
-            return null;
-        }
-        for (int i = 0; i < 3; i++) {
-            if (!Character.isDigit(plmn.charAt(i))) {
-                return null;
-            }
-        }
-        return plmn.substring(0, 3);
-    }
-
     /**
-     * 提取指定卡槽在多卡属性中的 3 位数字 MCC。
+     * 提取指定卡槽在多卡属性中的 3 位有效国家 MCC（200~799）。
      */
     private static String extractMccFromPropSlot(String propName, int slotIndex) {
         if (slotIndex < 0) {
@@ -132,37 +121,100 @@ public final class LocationGeoHook {
         if (slotIndex >= parts.length) {
             return null;
         }
-        return extractMcc(parts[slotIndex].trim());
+        String part = parts[slotIndex].trim();
+        return CountrySpoofer.isValidCountryMcc(part) ? part.substring(0, 3) : null;
     }
 
     /**
-     * 读取设备当前真实蜂窝驻网 MCC（优先本槽，本槽无驻网时回退到其他已驻网槽位）。
+     * 判断来自指定槽位、试图推荐某国家码的时区信号是否属于应拦截的伪造/跨国漫游建议。
      */
-    private static String resolveDeviceNetMcc(int slotIndex) {
-        String direct = extractMccFromPropSlot("gsm.operator.numeric", slotIndex);
-        if (direct != null) {
-            return direct;
+    private static boolean shouldBlockSpoofedTimeZoneCountry(
+            int slotIndex, String candidateIsoLower, ClassLoader cl) {
+        if (slotIndex < 0 || candidateIsoLower == null || candidateIsoLower.isEmpty()) {
+            return false;
         }
-        String raw = CountrySpoofer.getSystemProperty("gsm.operator.numeric", "");
-        if (raw.isEmpty()) {
-            return null;
+        String spoofIso = CountrySpoofer.getTargetIsoForSlot(slotIndex);
+        String nativeIso = CountrySpoofer.getNativeSimIsoForSlot(slotIndex);
+        boolean matchSpoof = spoofIso != null && spoofIso.equalsIgnoreCase(candidateIsoLower);
+        boolean matchNative = nativeIso != null && nativeIso.equalsIgnoreCase(candidateIsoLower);
+        if (!matchSpoof && !matchNative) {
+            return false;
         }
-        for (String part : raw.split(",", -1)) {
-            String mcc = extractMcc(part.trim());
-            if (mcc != null) {
-                return mcc;
+        return shouldBlockSpoofedTimeZoneCore(slotIndex, candidateIsoLower, null, nativeIso, matchNative, cl);
+    }
+
+    /**
+     * 判断来自指定槽位、试图推荐某 IANA 时区 ID 的建议是否属于应拦截的伪造/跨国漫游时区。
+     */
+    private static boolean shouldBlockSpoofedTimeZoneId(
+            int slotIndex, String zoneId, ClassLoader cl) {
+        if (slotIndex < 0 || zoneId == null || zoneId.isEmpty()) {
+            return false;
+        }
+        String spoofIso = CountrySpoofer.getTargetIsoForSlot(slotIndex);
+        String nativeIso = CountrySpoofer.getNativeSimIsoForSlot(slotIndex);
+        boolean matchSpoof = spoofIso != null && isZoneInCountry(zoneId, spoofIso, cl);
+        boolean matchNative = nativeIso != null && isZoneInCountry(zoneId, nativeIso, cl);
+        if (!matchSpoof && !matchNative) {
+            return false;
+        }
+        return shouldBlockSpoofedTimeZoneCore(slotIndex, null, zoneId, nativeIso, matchNative, cl);
+    }
+
+    private static boolean shouldBlockSpoofedTimeZoneCore(
+            int slotIndex,
+            String candidateIsoLower,
+            String zoneId,
+            String nativeIso,
+            boolean matchNative,
+            ClassLoader cl) {
+        String simMcc = extractMccFromPropSlot("gsm.sim.operator.numeric", slotIndex);
+        String physicalMcc = CountrySpoofer.resolvePhysicalDeviceMcc();
+        String realIso = "";
+        boolean matchesRealCountry = false;
+        if (physicalMcc != null) {
+            realIso = resolveRealCountryFromNumeric(physicalMcc, cl);
+            if (!realIso.isEmpty()) {
+                matchesRealCountry = (candidateIsoLower != null && realIso.equalsIgnoreCase(candidateIsoLower))
+                        || (zoneId != null && isZoneInCountry(zoneId, realIso, cl));
             }
         }
-        return null;
+        return evaluateTimeZoneBlockDecision(
+                simMcc,
+                physicalMcc,
+                realIso,
+                nativeIso,
+                matchNative,
+                CountrySpoofer.hasManualOverrideIso(),
+                matchesRealCountry);
     }
 
     /**
-     * 判断指定卡槽是否处于跨国漫游伪装态（飞回归属国本地驻网时返回 false）。
+     * 时区拦截核心纯判定逻辑：综合物理驻网 MCC、解析出的真实国家码与手动覆盖状态决定是否拦截。
      */
-    private static boolean isDeviceCrossCountryRoamingForSlot(int slotIndex) {
-        String simMcc = extractMccFromPropSlot("gsm.sim.operator.numeric", slotIndex);
-        String netMcc = resolveDeviceNetMcc(slotIndex);
-        return simMcc != null && netMcc != null && !simMcc.equals(netMcc);
+    static boolean evaluateTimeZoneBlockDecision(
+            String simMcc,
+            String physicalMcc,
+            String realIso,
+            String nativeIso,
+            boolean matchNative,
+            boolean hasManualOverride,
+            boolean matchesRealCountry) {
+        if (physicalMcc != null) {
+            if (realIso != null && !realIso.isEmpty()) {
+                return !matchesRealCountry;
+            }
+            // realIso 无法从 MccTable 或静态表反查时，仅在候选属本卡原生归属国且确凿身处本国时放行
+            if (matchNative && simMcc != null && simMcc.equals(physicalMcc)) {
+                return false;
+            }
+            return true;
+        }
+        // 整机无有效国家驻网 MCC 时（含锁 00101 残留 LTE 等异常态），仅在未开手动覆盖且原生为国内卡时放行本土初始化
+        if (!hasManualOverride && "cn".equalsIgnoreCase(nativeIso)) {
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -190,7 +242,7 @@ public final class LocationGeoHook {
             }
         } catch (Throwable ignored) {
         }
-        return "";
+        return CountrySpoofer.getFallbackIsoForMcc(operatorNumeric);
     }
 
     /**
@@ -269,10 +321,7 @@ public final class LocationGeoHook {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
                 int phoneId = getPhoneIdFromLocaleTracker(param.thisObject);
-                String target = getSpoofTargetForSlot(phoneId);
-                if (target != null) {
-                    param.setResult(target.toLowerCase(Locale.US));
-                }
+                applyNetworkIsoIfNotTimeZone(param, getSpoofTargetForSlot(phoneId));
             }
         });
 
@@ -319,10 +368,13 @@ public final class LocationGeoHook {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
                 if (param.args != null && param.args.length > 0 && param.args[0] != null) {
-                    int phoneId = (int) XposedHelpers.callMethod(param.args[0], "getPhoneId");
-                    String target = getSpoofTargetForSlot(phoneId);
-                    if (target != null) {
-                        param.setResult(target.toLowerCase(Locale.US));
+                    try {
+                        int phoneId = (int) XposedHelpers.callMethod(param.args[0], "getPhoneId");
+                        String target = getSpoofTargetForSlot(phoneId);
+                        if (target != null) {
+                            param.setResult(target.toLowerCase(Locale.US));
+                        }
+                    } catch (Throwable ignored) {
                     }
                 }
             }
@@ -332,10 +384,13 @@ public final class LocationGeoHook {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 if (param.args != null && param.args.length >= 2 && param.args[0] != null) {
-                    int phoneId = (int) XposedHelpers.callMethod(param.args[0], "getPhoneId");
-                    String target = getSpoofTargetForSlot(phoneId);
-                    if (target != null) {
-                        param.args[1] = target.toLowerCase(Locale.US);
+                    try {
+                        int phoneId = (int) XposedHelpers.callMethod(param.args[0], "getPhoneId");
+                        String target = getSpoofTargetForSlot(phoneId);
+                        if (target != null) {
+                            param.args[1] = target.toLowerCase(Locale.US);
+                        }
+                    } catch (Throwable ignored) {
                     }
                 }
             }
@@ -551,8 +606,76 @@ public final class LocationGeoHook {
         hookTimeZoneDetectorGuard(lpparam);
     }
 
+    private static int extractSlotIndexFromNitz(Object nitzStateMachine) {
+        if (nitzStateMachine == null) {
+            return -1;
+        }
+        try {
+            Object slotObj = XposedHelpers.getObjectField(nitzStateMachine, "mSlotIndex");
+            if (slotObj instanceof Number) {
+                return ((Number) slotObj).intValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object idObj = XposedHelpers.getObjectField(nitzStateMachine, "mPhoneId");
+            if (idObj instanceof Number) {
+                return ((Number) idObj).intValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object phone = XposedHelpers.getObjectField(nitzStateMachine, "mPhone");
+            if (phone != null) {
+                return (int) XposedHelpers.callMethod(phone, "getPhoneId");
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
     /**
-     * 终极兜底：拦截跨国漫游伪装期间误送入系统时区策略的归属国时区建议。
+     * com.android.phone 源头拦截：阻止无蜂窝或跨国漫游卡向 NitzStateMachine 注入归属国 ISO 污染系统时区。
+     */
+    private static void hookNitzCountryGuard(XC_LoadPackage.LoadPackageParam lpparam) {
+        Class<?> nitzCls = XposedHelpers.findClassIfExists(
+                "com.android.internal.telephony.nitz.NitzStateMachineImpl", lpparam.classLoader);
+        if (nitzCls == null) {
+            return;
+        }
+        XposedBridge.hookAllMethods(nitzCls, "handleCountryDetected", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (param.args == null || param.args.length == 0 || !(param.args[0] instanceof String)) {
+                    return;
+                }
+                String iso = ((String) param.args[0]).trim().toLowerCase(Locale.US);
+                int slotIndex = extractSlotIndexFromNitz(param.thisObject);
+                if (shouldBlockSpoofedTimeZoneCountry(slotIndex, iso, lpparam.classLoader)) {
+                    XposedBridge.log(TAG + "Blocked NITZ country detected [slot="
+                            + slotIndex + ", iso=" + iso + ", physicalMcc="
+                            + CountrySpoofer.resolvePhysicalDeviceMcc() + "]");
+                    // 仅当状态机当前已缓存了非法脏国家码时才清理，避免误清本槽原本合法的国家码缓存
+                    try {
+                        Object curObj = XposedHelpers.getObjectField(param.thisObject, "mCountryIsoCode");
+                        if (curObj instanceof String) {
+                            String curIso = ((String) curObj).trim().toLowerCase(Locale.US);
+                            if (!curIso.isEmpty()
+                                    && shouldBlockSpoofedTimeZoneCountry(slotIndex, curIso, lpparam.classLoader)) {
+                                XposedHelpers.callMethod(param.thisObject, "handleCountryUnavailable");
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    param.setResult(null);
+                }
+            }
+        });
+        XposedBridge.log(TAG + "Hooked NitzStateMachineImpl country guard");
+    }
+
+    /**
+     * 终极兜底：拦截跨国漫游伪装或无蜂窝卡误送入系统时区策略的归属国时区建议。
      */
     private static void hookTimeZoneDetectorGuard(XC_LoadPackage.LoadPackageParam lpparam) {
         Class<?> strategyCls = XposedHelpers.findClassIfExists(
@@ -575,22 +698,33 @@ public final class LocationGeoHook {
                     }
                     int slotIndex = ((Number) slotObj).intValue();
                     String zoneId = (String) zoneObj;
-                    if (zoneId.isEmpty() || !isDeviceCrossCountryRoamingForSlot(slotIndex)) {
-                        return;
+                    if (shouldBlockSpoofedTimeZoneId(slotIndex, zoneId, lpparam.classLoader)) {
+                        String spoofIso = CountrySpoofer.getTargetIsoForSlot(slotIndex);
+                        String physicalMcc = CountrySpoofer.resolvePhysicalDeviceMcc();
+                        XposedBridge.log(TAG + "Blocked spoofed telephony timezone suggestion [slot="
+                                + slotIndex + ", zone=" + zoneId + ", spoofIso=" + spoofIso
+                                + ", physicalMcc=" + physicalMcc + "]");
+                        // 用同槽位空建议覆盖原有高分缓存（score=0），促使系统重新采信有效真实槽位的时区
+                        try {
+                            Class<?> suggestionCls = XposedHelpers.findClassIfExists(
+                                    "android.app.timezonedetector.TelephonyTimeZoneSuggestion",
+                                    lpparam.classLoader);
+                            if (suggestionCls == null) {
+                                suggestionCls = suggestion.getClass();
+                            }
+                            Object emptySuggestion = XposedHelpers.callStaticMethod(
+                                    suggestionCls,
+                                    "createEmptySuggestion",
+                                    slotIndex,
+                                    "VoWiFiX blocked spoofed timezone: " + zoneId);
+                            if (emptySuggestion != null) {
+                                param.args[0] = emptySuggestion;
+                                return;
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        param.setResult(null);
                     }
-                    String spoofIso = CountrySpoofer.getTargetIsoForSlot(slotIndex);
-                    if (spoofIso == null || !isZoneInCountry(zoneId, spoofIso, lpparam.classLoader)) {
-                        return;
-                    }
-                    // 若真实驻网国家自身也使用同一时区（如跨国共享 IANA 时区），则放行避免误杀
-                    String netMcc = resolveDeviceNetMcc(slotIndex);
-                    String realIso = resolveRealCountryFromNumeric(netMcc, lpparam.classLoader);
-                    if (!realIso.isEmpty() && isZoneInCountry(zoneId, realIso, lpparam.classLoader)) {
-                        return;
-                    }
-                    XposedBridge.log(TAG + "Blocked spoofed telephony timezone suggestion [slot="
-                            + slotIndex + ", zone=" + zoneId + ", spoofIso=" + spoofIso + ", realIso=" + realIso + "]");
-                    param.setResult(null);
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + "TimeZone guard err: " + t);
                 }

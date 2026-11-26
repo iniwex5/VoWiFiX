@@ -10,7 +10,7 @@ ROOT_MOD_DIR="$ROOT_DIR/root-module"
 BIN_OUT="$ROOT_MOD_DIR/system/bin/vowifix-efs"
 LSP_DIR="$ROOT_DIR/lsposed-module"
 
-VERSION="v1.0.6"
+VERSION="v1.0.7"
 ZIP_OUT="$DIST_DIR/VoWiFiX-${VERSION}.zip"
 APK_OUT="$DIST_DIR/VoWiFiX-LSPosed-${VERSION}.apk"
 
