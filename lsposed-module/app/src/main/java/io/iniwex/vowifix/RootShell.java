@@ -19,6 +19,7 @@ public final class RootShell {
     public static final String DISABLED_FLAG = DATA_DIR + "/watcher.disabled";
     public static final String MODULE_DIR = "/data/adb/modules/vowifix";
     public static final String BACKEND_CONF_PATH = DATA_DIR + "/backend.conf";
+    public static final int EXIT_REFRESH_UNSUPPORTED = 98;
     public static final int EXIT_TIMEOUT = 124;
 
     public static final class Result {

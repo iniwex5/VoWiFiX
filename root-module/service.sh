@@ -259,7 +259,7 @@ get_target_last_refresh_ts() {
 }
 
 # 在持有 diag.lock 时按冷却与通话状态安全触发 QRTR QMI_VS 刷新：
-# 返回 10/11/12=已成功刷新(slot0/slot1/all)，20/21/22=通话中延后，30/31/32=冷却期释锁等待，1=刷新失败
+# 返回 10/11/12=已成功刷新(slot0/slot1/all)，20/21/22=通话中延后，30/31/32=冷却期释锁等待，40=基带不支持热刷新（无 QMI_VS 0xe5，需重启生效），1=刷新失败
 run_locked_qmi_refresh() {
     r_reason="$1"
     r_target="$2"
@@ -294,6 +294,10 @@ run_locked_qmi_refresh() {
             slot1) return 11 ;;
             *) return 12 ;;
         esac
+    fi
+    if [ "$RRC" -eq 98 ] || printf '%s\n' "$ROUT" | grep -q 'EFS_REFRESH_UNSUPPORTED=1'; then
+        log_msg "INFO: [$r_reason] hot refresh unsupported on this baseband (no QMI_VS 0xe5); EFS changes synced, reboot device once to take effect"
+        return 40
     fi
     return 1
 }
@@ -451,6 +455,10 @@ apply_patch_and_refresh() {
                         *) exit 12 ;;
                     esac
                 fi
+                if [ "$RRC" -eq 98 ] || printf '%s\n' "$ROUT" | grep -q 'EFS_REFRESH_UNSUPPORTED=1'; then
+                    log_msg "INFO: [$reason] hot refresh unsupported on this baseband (no QMI_VS 0xe5); EFS changes synced, reboot device once to take effect"
+                    exit 40
+                fi
                 exit 1
             ) 8>&-
         ) 8>"$LOCK_FILE"
@@ -471,6 +479,9 @@ apply_patch_and_refresh() {
             LAST_REFRESH_TS_S0="$now_ts"
             LAST_REFRESH_TS_S1="$now_ts"
             did_refresh=1
+            ;;
+        40)
+            # 基带无 QMI_VS 0xe5 服务，跳过 20s 复位观察期并保持重启生效提示
             ;;
     esac
 

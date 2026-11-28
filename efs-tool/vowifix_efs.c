@@ -32,6 +32,7 @@
 #define DIAG_CON_ALL_EXT 0x03FFU
 #define DIAG_CON_LEGACY_ALL 0x0FFFU
 
+#define EXIT_CODE_REFRESH_UNSUPPORTED 98
 #define EXIT_CODE_LOCK_BUSY 99
 #define EXIT_CODE_TIMEOUT 124
 #define DEFAULT_READ_TIMEOUT_SEC 12
@@ -333,6 +334,17 @@ static int compute_effective_timeout_ms(int req_timeout_ms) {
     return req_timeout_ms;
 }
 
+/* 判断 read() 结果是否由 SIGALRM 超时导致：兼容 -1/EINTR 以及部分 diagchar 驱动被中断后返回 0 */
+static int diag_is_read_timeout(ssize_t n, int saved_errno, int io_timed_out) {
+    if (!io_timed_out) return 0;
+    return (n == -2) || (n == 0) || (n < 0 && saved_errno == EINTR);
+}
+
+/* 校验传统 /dev/diag write() 返回值：旧版 diagchar 驱动向内置 MPSS 投递请求成功后可能返回 0 */
+static int diagchar_write_accepted(ssize_t sent, int tx_len) {
+    return (sent == 0 || sent == (ssize_t)tx_len);
+}
+
 /* 带硬超时保护的 read()：同时打断无 .poll 回调的阻塞式 diagchar_read 并返回 -2 */
 static ssize_t diag_read_with_alarm(int fd, void *buf, size_t cap, int timeout_ms) {
     int eff_ms = compute_effective_timeout_ms(timeout_ms);
@@ -370,8 +382,8 @@ static ssize_t diag_read_with_alarm(int fd, void *buf, size_t cap, int timeout_m
     memset(&zero_itv, 0, sizeof(zero_itv));
     setitimer(ITIMER_REAL, &zero_itv, NULL);
 
-    /* 仅当 read() 确因信号中断返回 -1 (EINTR) 且闹钟已触发时判为超时，正常 EOF (n==0) 原样返回 */
-    if (n < 0 && saved_errno == EINTR && g_io_timed_out) {
+    /* 兼容 -1/EINTR 以及部分忽略中断返回 0 的驱动；正常未超时的 EOF (n==0) 原样返回 */
+    if (diag_is_read_timeout(n, saved_errno, (int)g_io_timed_out)) {
         if (g_cmd_deadline_ms > 0L && !g_efs_write_critical && diag_now_ms() >= g_cmd_deadline_ms) {
             g_cmd_timed_out = 1;
         }
@@ -622,8 +634,14 @@ static int diagchar_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_
                                    cmd, cmd_len, send_buf, (int)sizeof(send_buf));
     if (tx_len < 0) return -1;
 
-    if (write(ctx->fd, send_buf, (size_t)tx_len) != (ssize_t)tx_len) {
+    /* 旧版 diagchar 可能用返回值 0 表示整个请求已被接收 */
+    ssize_t sent = write(ctx->fd, send_buf, (size_t)tx_len);
+    if (sent < 0) {
         fprintf(stderr, "diag write failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+    if (!diagchar_write_accepted(sent, tx_len)) {
+        fprintf(stderr, "diag write returned %zd bytes, expected %d\n", sent, tx_len);
         return -1;
     }
 
@@ -653,9 +671,9 @@ static int diagchar_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_
         if (rem <= 0) break;
 
         ssize_t n = diag_read_with_alarm(ctx->fd, rbuf, sizeof(rbuf), (int)rem);
-        if (n == -2) {
-            g_saw_diag_timeout = 1;
-            return -2;
+        /* 部分 diagchar 驱动忽略等待队列中断错误，在闹钟触发后返回 0 */
+        if (n == -2 || (n == 0 && g_io_timed_out)) {
+            break;
         }
         if (n <= 0) {
             return -1;
@@ -671,6 +689,7 @@ static int diagchar_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int cmd_
         g_cmd_timed_out = 1;
     }
     g_saw_diag_timeout = 1;
+    errno = ETIMEDOUT;
     return -2;
 }
 
@@ -942,6 +961,7 @@ static int diag_router_transact(const diag_ctx_t *ctx, const uint8_t *cmd, int c
         g_cmd_timed_out = 1;
     }
     g_saw_diag_timeout = 1;
+    errno = ETIMEDOUT;
     return -2;
 }
 
@@ -1213,7 +1233,12 @@ static int efs_read_all_mem(const diag_ctx_t *ctx, const char *efs_path, uint8_t
     memcpy(&fd_efs, rsp + 4, 4);
     memcpy(&diag_errno, rsp + 8, 4);
     if (fd_efs < 0 || diag_errno != 0) {
-        return (diag_errno == EFS2_DIAG_ENOENT) ? -2 : -1;
+        if (diag_errno == EFS2_DIAG_ENOENT) {
+            return -2;
+        }
+        fprintf(stderr, "EFS2 OPEN(%s) failed: fd=%d efs_errno=0x%x\n",
+                efs_path, fd_efs, (unsigned int)diag_errno);
+        return -1;
     }
 
     size_t cap = 4096, total = 0;
@@ -2234,7 +2259,7 @@ static int qmi_parse_void_resp(const uint8_t *buf, size_t len, uint16_t expected
     return -1;
 }
 
-/* 查询内核 QRTR 路由表定位目标 QMI 服务节点 */
+/* 查询内核 QRTR 路由表定位目标 QMI 服务节点；返回 0=找到，-2=确认服务未在线，-1=通信错误 */
 static int qrtr_lookup_service(int fd, uint32_t service, uint32_t *out_node, uint32_t *out_port) {
     struct sockaddr_qrtr_uapi sq;
     socklen_t sl = sizeof(sq);
@@ -2259,11 +2284,13 @@ static int qrtr_lookup_service(int fd, uint32_t service, uint32_t *out_node, uin
     }
 
     int found = 0;
+    int got_end = 0;
     for (;;) {
         ssize_t n = recv(fd, &pkt, sizeof(pkt), 0);
         if (n < (ssize_t)sizeof(pkt)) break;
         if (pkt.cmd == QRTR_TYPE_NEW_SERVER && pkt.server.service == 0 &&
             pkt.server.instance == 0 && pkt.server.node == 0 && pkt.server.port == 0) {
+            got_end = 1;
             break;
         }
         if (pkt.cmd == QRTR_TYPE_NEW_SERVER && pkt.server.service == service && !found) {
@@ -2272,7 +2299,35 @@ static int qrtr_lookup_service(int fd, uint32_t service, uint32_t *out_node, uin
             found = 1;
         }
     }
-    return found ? 0 : -1;
+    if (found) return 0;
+    return got_end ? -2 : -1;
+}
+
+/* 判断 errno 是否表明内核不支持 AF_QIPCRTR 协议族 */
+static int qrtr_is_unsupported_errno(int err) {
+#ifdef EPFNOSUPPORT
+    if (err == EPFNOSUPPORT) return 1;
+#endif
+    return err == EAFNOSUPPORT || err == EPROTONOSUPPORT;
+}
+
+/* 纯只读无锁探测当前基带是否在线提供 QMI_VS (0xe5) 热刷新服务：1=支持，0=明确不支持，-1=通信异常 */
+static int qrtr_probe_qmi_vs(void) {
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return qrtr_is_unsupported_errno(errno) ? 0 : -1;
+    }
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint32_t node = 0, port = 0;
+    int lrc = qrtr_lookup_service(fd, QMI_VS_SERVICE_ID, &node, &port);
+    close(fd);
+    if (lrc == 0) return 1;
+    if (lrc == -2) return 0;
+    return -1;
 }
 
 /* 发送 QMI 请求并阻塞等待目标事务响应，自动跳过路过事件包；返回 0=成功，1=QMI拒绝，-1=通信或解析失败 */
@@ -2308,12 +2363,18 @@ static int qmi_send_and_wait_void(int fd, const struct sockaddr_qrtr_uapi *dst,
     return -1;
 }
 
-/* 对单一卡槽订阅创建独立 QRTR 客户端并执行订阅绑定 + MCFG/EFS 热刷新；返回 0=成功，-2=非主卡绑定被拒跳过，-1=失败 */
+/* 对单一卡槽订阅创建独立 QRTR 客户端并执行订阅绑定 + MCFG/EFS 热刷新；返回 0=成功，-2=非主卡绑定被拒跳过，-3=基带不支持热刷新，-1=失败 */
 static int qmi_trigger_single_sub_refresh(uint32_t subs_id, uint32_t config_type,
                                           uint32_t activation_type, int strict_bind) {
     int fd = socket(AF_QIPCRTR, SOCK_DGRAM, 0);
     if (fd < 0) {
-        fprintf(stderr, "socket(AF_QIPCRTR) failed: %s\n", strerror(errno));
+        int err = errno;
+        if (qrtr_is_unsupported_errno(err)) {
+            printf("EFS_REFRESH_UNSUPPORTED=1 reason=qrtr_unsupported\n");
+            fprintf(stderr, "AF_QIPCRTR not supported by kernel (hot refresh unsupported; reboot required)\n");
+            return -3;
+        }
+        fprintf(stderr, "socket(AF_QIPCRTR) failed: %s\n", strerror(err));
         return -1;
     }
 
@@ -2323,7 +2384,15 @@ static int qmi_trigger_single_sub_refresh(uint32_t subs_id, uint32_t config_type
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     uint32_t node = 0, port = 0;
-    if (qrtr_lookup_service(fd, QMI_VS_SERVICE_ID, &node, &port) != 0) {
+    int lrc = qrtr_lookup_service(fd, QMI_VS_SERVICE_ID, &node, &port);
+    if (lrc == -2) {
+        printf("EFS_REFRESH_UNSUPPORTED=1 reason=qmi_vs_offline service=0x%x\n", QMI_VS_SERVICE_ID);
+        fprintf(stderr, "QRTR service 0x%x not online (hot refresh unsupported on this baseband; reboot required)\n",
+                QMI_VS_SERVICE_ID);
+        close(fd);
+        return -3;
+    }
+    if (lrc != 0) {
         fprintf(stderr, "QRTR service 0x%x not online\n", QMI_VS_SERVICE_ID);
         close(fd);
         return -1;
@@ -2426,12 +2495,17 @@ static int qmi_trigger_modem_efs_refresh(refresh_slot_opt_t slot_opt, uint32_t c
     }
 
     int rc0 = qmi_trigger_single_sub_refresh(QMI_SUBS_PRIMARY, config_type, activation_type, 0);
+    if (rc0 == -3) {
+        return -3;
+    }
     if (rc0 == 0) {
         /* 双卡依次刷新间预留 500ms 间隔，避免基带 MCFG 队列瞬时拥塞 */
         usleep(500 * 1000);
     }
     int rc1 = qmi_trigger_single_sub_refresh(QMI_SUBS_SECONDARY, config_type, activation_type, 0);
-    return (rc0 == 0 || rc1 == 0) ? 0 : -1;
+    if (rc0 == 0 || rc1 == 0) return 0;
+    if (rc1 == -3) return -3;
+    return -1;
 }
 
 /* ===================== QRTR / QMI NAS 只读蜂窝状态核验 ===================== */
@@ -3270,12 +3344,13 @@ static int run_self_tests(void) {
     long t_start = diag_now_ms();
     uint8_t sink[32];
     ssize_t pr_n = diag_read_with_alarm(block_pipe[0], sink, sizeof(sink), 120);
+    int pr_err = errno;
     long t_cost = diag_now_ms() - t_start;
     close(block_pipe[0]);
     close(block_pipe[1]);
-    if (pr_n != -2 || !g_io_timed_out || t_cost > 1500) {
-        fprintf(stderr, "FAIL T14 pipe read alarm (n=%zd timed=%d cost=%ldms)\n",
-                pr_n, (int)g_io_timed_out, t_cost);
+    if (pr_n != -2 || pr_err != ETIMEDOUT || !g_io_timed_out || t_cost > 1500) {
+        fprintf(stderr, "FAIL T14 pipe read alarm (n=%zd err=%d timed=%d cost=%ldms)\n",
+                pr_n, pr_err, (int)g_io_timed_out, t_cost);
         return 1;
     }
 
@@ -3294,11 +3369,13 @@ static int run_self_tests(void) {
     uint8_t probe_rsp[64];
     long tx_start = diag_now_ms();
     int tx_rc = diagchar_transact(&block_ctx, &probe_cmd, 1, probe_rsp, sizeof(probe_rsp), 150);
+    int tx_err = errno;
     long tx_cost = diag_now_ms() - tx_start;
     close(sv_block[0]);
     close(sv_block[1]);
-    if (tx_rc != -2 || !g_saw_diag_timeout || tx_cost > 1500) {
-        fprintf(stderr, "FAIL T14 diagchar_transact timeout (rc=%d cost=%ldms)\n", tx_rc, tx_cost);
+    if (tx_rc != -2 || tx_err != ETIMEDOUT || !g_saw_diag_timeout || tx_cost > 1500) {
+        fprintf(stderr, "FAIL T14 diagchar_transact timeout (rc=%d err=%d cost=%ldms)\n",
+                tx_rc, tx_err, tx_cost);
         return 1;
     }
     set_cmd_timeout_sec(0);
@@ -3348,7 +3425,32 @@ static int run_self_tests(void) {
         return 1;
     }
 
-    printf("SELF-TEST PASSED: all 15 INI/SE/S2B merge, diagchar ABI/SIGALRM/lock, diag-router & QMI VS/NAS cases OK\n");
+    /* 用例 16：diagchar write()==0 接收、闹钟触发后 read()==0 判超时与热刷新退出码隔离校验 */
+    if (diagchar_write_accepted(0, 16) != 1 ||
+        diagchar_write_accepted(16, 16) != 1 ||
+        diagchar_write_accepted(-1, 16) != 0 ||
+        diagchar_write_accepted(8, 16) != 0 ||
+        diagchar_write_accepted(17, 16) != 0) {
+        fprintf(stderr, "FAIL T16 diagchar_write_accepted\n");
+        return 1;
+    }
+    if (diag_is_read_timeout(0, 0, 1) != 1 ||
+        diag_is_read_timeout(0, 0, 0) != 0 ||
+        diag_is_read_timeout(-1, EINTR, 1) != 1 ||
+        diag_is_read_timeout(-1, EIO, 1) != 0 ||
+        diag_is_read_timeout(-2, 0, 1) != 1 ||
+        diag_is_read_timeout(12, 0, 1) != 0) {
+        fprintf(stderr, "FAIL T16 diag_is_read_timeout\n");
+        return 1;
+    }
+    if (EXIT_CODE_REFRESH_UNSUPPORTED != 98 ||
+        EXIT_CODE_REFRESH_UNSUPPORTED == EXIT_CODE_LOCK_BUSY ||
+        EXIT_CODE_REFRESH_UNSUPPORTED == EXIT_CODE_TIMEOUT) {
+        fprintf(stderr, "FAIL T16 exit code isolation\n");
+        return 1;
+    }
+
+    printf("SELF-TEST PASSED: all 16 INI/SE/S2B merge, diagchar ABI/SIGALRM/lock, diag-router & QMI VS/NAS cases OK\n");
     return 0;
 }
 
@@ -3631,7 +3733,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "Usage: %s [--ils-only] [--no-lock] [--remote|--local] [--timeout <sec>] "
                 "[--backend=auto|diagchar|diag-router|libdiag|none] [--backup-dir <dir>] "
-                "detect|probe|status [slot0|slot1|all]|patch [slot0|slot1|all]|restore [slot0|slot1|all]|"
+                "detect|refresh-probe|probe|status [slot0|slot1|all]|patch [slot0|slot1|all]|restore [slot0|slot1|all]|"
                 "refresh [slot0|slot1|all] [cfg act]|cell-status [slot0|slot1|all]|stat <efs_path>|read <efs_path> <local_out>|--self-test\n",
                 argv[0]);
         return 2;
@@ -3647,6 +3749,19 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "detect") == 0) {
         const diag_transport_ops_t *ops = resolve_diag_backend(backend_opt);
         printf("BACKEND=%s\n", ops ? ops->name : "none");
+        return 0;
+    }
+
+    /* refresh-probe 为纯无副作用、无锁探测：检查 QRTR 是否在线暴露 QMI_VS (0xe5) 热刷新服务 */
+    if (strcmp(cmd, "refresh-probe") == 0) {
+        int pr = qrtr_probe_qmi_vs();
+        if (pr > 0) {
+            printf("REFRESH=qmi_vs\n");
+        } else if (pr == 0) {
+            printf("REFRESH=unsupported\n");
+        } else {
+            printf("REFRESH=unknown\n");
+        }
         return 0;
     }
 
@@ -3701,7 +3816,8 @@ int main(int argc, char **argv) {
             if (lock_fd >= 0) close(lock_fd);
             return 2;
         }
-        int rrc = (qmi_trigger_modem_efs_refresh(slot_opt, cfg, act) == 0) ? 0 : 1;
+        int qrc = qmi_trigger_modem_efs_refresh(slot_opt, cfg, act);
+        int rrc = (qrc == 0) ? 0 : ((qrc == -3) ? EXIT_CODE_REFRESH_UNSUPPORTED : 1);
         if (lock_fd >= 0) close(lock_fd);
         return rrc;
     }

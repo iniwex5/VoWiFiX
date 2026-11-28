@@ -10,7 +10,7 @@ ROOT_MOD_DIR="$ROOT_DIR/root-module"
 BIN_OUT="$ROOT_MOD_DIR/system/bin/vowifix-efs"
 LSP_DIR="$ROOT_DIR/lsposed-module"
 
-VERSION="v1.0.8"
+VERSION="v1.0.9"
 ZIP_OUT="$DIST_DIR/VoWiFiX-${VERSION}.zip"
 APK_OUT="$DIST_DIR/VoWiFiX-LSPosed-${VERSION}.apk"
 
@@ -105,6 +105,12 @@ run_host_selftest() {
     "$cc_bin" -O2 -Wall -Wextra "$C_SRC" -o "$host_bin"
     "$host_bin" --self-test
     [ "$("$host_bin" --backend=none detect)" = "BACKEND=none" ] || die "detect --backend=none 校验失败"
+    [ "$("$host_bin" refresh-probe)" = "REFRESH=unsupported" ] || die "refresh-probe 校验失败"
+    local ref_rc=0
+    local ref_out=""
+    ref_out="$("$host_bin" refresh --no-lock 2>&1)" || ref_rc=$?
+    [ "$ref_rc" -eq 98 ] || die "refresh --no-lock 预期退出码 98，实际 $ref_rc"
+    printf '%s\n' "$ref_out" | grep -q "EFS_REFRESH_UNSUPPORTED=1" || die "refresh --no-lock 缺少 EFS_REFRESH_UNSUPPORTED=1 输出"
     rm -f "$host_bin"
     trap - RETURN
 }

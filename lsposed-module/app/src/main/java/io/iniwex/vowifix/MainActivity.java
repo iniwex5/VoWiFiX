@@ -724,9 +724,13 @@ public class MainActivity extends Activity {
         } else if (!snap.watcherEnabled) {
             tvWatcherHint.setText("已暂停后台自动监听，仍可下方手动热适配");
         } else if (snap.hasDiagBackend()) {
-            tvWatcherHint.setText("插拔或切换 SIM 卡时自动修补并热刷新");
+            tvWatcherHint.setText(snap.isHotRefreshUnsupported()
+                    ? "切卡时自动合并 EFS 并落盘（本基带不支持热刷新，改动后需重启生效）"
+                    : "插拔或切换 SIM 卡时自动修补并热刷新");
         } else {
-            tvWatcherHint.setText("未开放 Diag 通道，切卡时自动校准 siminfo 策略");
+            tvWatcherHint.setText(snap.isHotRefreshUnsupported()
+                    ? "未开放 Diag 且无热刷新服务，切卡时自动校准 siminfo 策略"
+                    : "未开放 Diag 通道，切卡时自动校准 siminfo 策略");
         }
 
         for (int i = 0; i < 2; i++) {
@@ -1125,6 +1129,10 @@ public class MainActivity extends Activity {
                         + "  RRC=$?\n"
                         + "  printf '%s\\n' \"$ROUT\"\n"
                         + "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] refresh RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                        + "  if [ \"$RRC\" -eq 98 ] || printf '%s\\n' \"$ROUT\" | grep -q 'EFS_REFRESH_UNSUPPORTED=1'; then\n"
+                        + "    echo 'VOWIFIX_EFS_NEED_REBOOT=1'\n"
+                        + "    exit 0\n"
+                        + "  fi\n"
                         + "  [ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
                         + "  exit $RRC\n"
                         + "elif [ \"$HAS_SIM_CHG\" -eq 1 ]; then\n"
@@ -1133,6 +1141,10 @@ public class MainActivity extends Activity {
                         + "  RRC=$?\n"
                         + "  printf '%s\\n' \"$ROUT\"\n"
                         + "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] siminfo-only refresh RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                        + "  if [ \"$RRC\" -eq 98 ] || printf '%s\\n' \"$ROUT\" | grep -q 'EFS_REFRESH_UNSUPPORTED=1'; then\n"
+                        + "    echo 'VOWIFIX_SIMINFO_NEED_REBOOT=1'\n"
+                        + "    exit 0\n"
+                        + "  fi\n"
                         + "  [ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
                         + "  exit $RRC\n"
                         + "else\n"
@@ -1151,6 +1163,10 @@ public class MainActivity extends Activity {
                         + "RRC=$?\n"
                         + "printf '%s\\n' \"$ROUT\"\n"
                         + "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] upper-only adapt (backend=none) RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                        + "if [ \"$RRC\" -eq 98 ] || printf '%s\\n' \"$ROUT\" | grep -q 'EFS_REFRESH_UNSUPPORTED=1'; then\n"
+                        + "  echo 'VOWIFIX_SIMINFO_NEED_REBOOT=1'\n"
+                        + "  exit 0\n"
+                        + "fi\n"
                         + "[ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
                         + "exit $RRC\n";
             }
@@ -1215,9 +1231,12 @@ public class MainActivity extends Activity {
                 || !latestSnapshot.binaryAvailable || !latestSnapshot.hasDiagBackend()) {
             return;
         }
+        String extraNote = latestSnapshot.isHotRefreshUnsupported()
+                ? "\n\n当前基带不支持免重启热刷新，还原落盘后需重启手机 1 次生效。"
+                : "\n\n若发生写入变更，将严格等待 6 秒落盘后再尝试热刷新基带。";
         new AlertDialog.Builder(this)
                 .setTitle("还原原始 EFS 备份")
-                .setMessage("确定要将修改过的配置与漫游开关字节恢复为首次备份的原始状态吗？\n\n若发生写入变更，将严格等待 6 秒落盘后再尝试热刷新基带。")
+                .setMessage("确定要将修改过的配置与漫游开关字节恢复为首次备份的原始状态吗？" + extraNote)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("确定还原", (d, w) -> executeRestoreEfs())
                 .show();
@@ -1258,6 +1277,10 @@ public class MainActivity extends Activity {
                     + "  RRC=$?\n"
                     + "  printf '%s\\n' \"$ROUT\"\n"
                     + "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [manual] post-restore refresh RRC=$RRC | $(echo \"$ROUT\" | tr '\\n' '; ')\" >> '" + RootShell.LOG_PATH + "'\n"
+                    + "  if [ \"$RRC\" -eq 98 ] || printf '%s\\n' \"$ROUT\" | grep -q 'EFS_REFRESH_UNSUPPORTED=1'; then\n"
+                    + "    echo 'VOWIFIX_RESTORE_NEED_REBOOT=1'\n"
+                    + "    exit 0\n"
+                    + "  fi\n"
                     + "  [ \"$RRC\" -eq 0 ] && echo 'VOWIFIX_REFRESHED=1'\n"
                     + "  exit $RRC\n"
                     : "  echo 'VOWIFIX_RESTORED_COOLDOWN=1'\n")
@@ -1321,6 +1344,27 @@ public class MainActivity extends Activity {
             refreshStateAsync(false, false, true);
             return;
         }
+        if (r.stdout.contains("VOWIFIX_EFS_NEED_REBOOT=1")) {
+            setBusy(false, "EFS 已写入并完成 6s 落盘，当前基带不支持免重启热刷新（无 QMI_VS 0xe5），请重启手机 1 次生效");
+            refreshStateAsync(true, false, true);
+            return;
+        }
+        if (r.stdout.contains("VOWIFIX_RESTORE_NEED_REBOOT=1")) {
+            setBusy(false, "已还原原始 EFS 备份并完成 6s 落盘，当前基带不支持免重启热刷新，请重启手机 1 次生效");
+            refreshStateAsync(true, false, true);
+            return;
+        }
+        if (r.stdout.contains("VOWIFIX_SIMINFO_NEED_REBOOT=1")) {
+            setBusy(false, "已校准 siminfo 策略，当前基带不支持免重启热刷新，请重启手机或开关飞行模式生效");
+            refreshStateAsync(false, true, true);
+            return;
+        }
+        if (r.exitCode == RootShell.EXIT_REFRESH_UNSUPPORTED
+                || r.stdout.contains("EFS_REFRESH_UNSUPPORTED=1")) {
+            setBusy(false, "当前基带未提供 QMI_VS (0xe5) 服务，不支持免重启热刷新；修改 EFS 后重启手机 1 次即可生效");
+            refreshStateAsync(false, true, true);
+            return;
+        }
         if (!r.isSuccess()) {
             String err = r.stderr.isEmpty() ? r.stdout : r.stderr;
             setBusy(false, actionName + "失败 (exit=" + r.exitCode + "): " + summarizeLastLine(err));
@@ -1338,7 +1382,10 @@ public class MainActivity extends Activity {
             setBusy(false, "已还原原始备份并完成 6s 落盘（45s 刷新冷却中，请稍后手动刷新或重启）");
             refreshStateAsync(true, false, true);
         } else if (r.stdout.contains("VOWIFIX_ALREADY_CLEAN=1")) {
-            setBusy(false, "当前状态已对齐，无需改动（若需强制重载可点“仅触发基带热刷新”）");
+            boolean noHotRefresh = latestSnapshot != null && latestSnapshot.isHotRefreshUnsupported();
+            setBusy(false, noHotRefresh
+                    ? "当前 EFS 与 siminfo 状态均已对齐，无需改动（若刚修改过基带配置，请重启手机 1 次生效）"
+                    : "当前状态已对齐，无需改动（若需强制重载可点“仅触发基带热刷新”）");
             refreshStateAsync(true, false, true);
         } else {
             setBusy(false, actionName + "已执行完成");
@@ -1501,15 +1548,23 @@ public class MainActivity extends Activity {
         boolean hasRoot = latestSnapshot != null && latestSnapshot.hasRoot;
         boolean hasBin = latestSnapshot != null && latestSnapshot.binaryAvailable;
         boolean hasDiag = latestSnapshot != null && latestSnapshot.hasDiagBackend();
+        boolean hotRefreshUnsupported = latestSnapshot != null && latestSnapshot.isHotRefreshUnsupported();
         boolean canModem = !busy && hasRoot && hasBin;
+        boolean canRefreshModem = canModem && !hotRefreshUnsupported;
         boolean canRestore = canModem && hasDiag;
 
+        if (btnHotAdapt != null) {
+            btnHotAdapt.setText((hasRoot && hasBin && hasDiag && hotRefreshUnsupported) ? "一键适配 EFS" : "一键热适配");
+        }
+        if (btnRefreshModem != null) {
+            btnRefreshModem.setText((hasRoot && hasBin && hotRefreshUnsupported) ? "热刷新 (基带不支持)" : "仅触发基带热刷新");
+        }
         if (btnRestoreEfs != null) {
             btnRestoreEfs.setText((hasRoot && hasBin && !hasDiag) ? "还原备份 (无 Diag)" : "还原原始 EFS 备份");
         }
 
         UiHelper.applyButtonStyle(this, palette, btnHotAdapt, UiHelper.BTN_PRIMARY, canModem);
-        UiHelper.applyButtonStyle(this, palette, btnRefreshModem, UiHelper.BTN_SECONDARY, canModem);
+        UiHelper.applyButtonStyle(this, palette, btnRefreshModem, UiHelper.BTN_SECONDARY, canRefreshModem);
         UiHelper.applyButtonStyle(this, palette, btnRestoreCellular, UiHelper.BTN_SECONDARY, !busy && hasRoot);
         UiHelper.applyButtonStyle(this, palette, btnRestoreEfs, UiHelper.BTN_DANGER, canRestore);
         UiHelper.applyButtonStyle(this, palette, btnRadioInfo, UiHelper.BTN_SECONDARY, !busy);

@@ -220,6 +220,7 @@ public final class TelephonyProbe {
         public boolean watcherRunning;
         public boolean watcherEnabled;
         public String diagBackend = "unknown";
+        public String hotRefreshCapability = "unknown";
         public String baseband = "";
         public SlotSnapshot[] slots = new SlotSnapshot[2];
         public EfsSlotStatus[] efs = new EfsSlotStatus[]{new EfsSlotStatus(), new EfsSlotStatus()};
@@ -233,6 +234,10 @@ public final class TelephonyProbe {
             return diagBackend != null && !diagBackend.isEmpty()
                     && !"none".equalsIgnoreCase(diagBackend)
                     && !"unknown".equalsIgnoreCase(diagBackend);
+        }
+
+        public boolean isHotRefreshUnsupported() {
+            return "unsupported".equalsIgnoreCase(hotRefreshCapability);
         }
     }
 
@@ -428,12 +433,16 @@ public final class TelephonyProbe {
                 .append("  fi\n")
                 .append("fi\n")
                 .append("BKD='unknown'\n")
+                .append("HREF='unknown'\n")
                 .append("if [ -n \"$BIN\" ]; then\n")
                 .append("  DET=$(\"$BIN\" detect 2>/dev/null | head -n 1)\n")
                 .append("  BKD=\"${DET#BACKEND=}\"\n")
                 .append("  [ -n \"$BKD\" ] || BKD='none'\n")
+                .append("  RDET=$(\"$BIN\" refresh-probe 2>/dev/null | head -n 1)\n")
+                .append("  HREF=\"${RDET#REFRESH=}\"\n")
+                .append("  [ -n \"$HREF\" ] || HREF='unknown'\n")
                 .append("fi\n")
-                .append("echo \"META:$MOD_OK:$BIN_OK:$WATCH_EN:$WATCH_RUN:$BKD\"\n")
+                .append("echo \"META:$MOD_OK:$BIN_OK:$WATCH_EN:$WATCH_RUN:$BKD:$HREF\"\n")
                 .append("echo '===LOG_BEGIN==='\n")
                 .append("[ -f '").append(RootShell.LOG_PATH).append("' ] && tail -n 60 '").append(RootShell.LOG_PATH).append("' 2>/dev/null\n")
                 .append("echo '===LOG_END==='\n");
@@ -619,6 +628,9 @@ public final class TelephonyProbe {
                 }
                 if (p.length >= 6 && !p[5].trim().isEmpty()) {
                     snap.diagBackend = p[5].trim();
+                }
+                if (p.length >= 7 && !p[6].trim().isEmpty()) {
+                    snap.hotRefreshCapability = p[6].trim();
                 }
             }
         }
