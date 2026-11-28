@@ -507,6 +507,12 @@ while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$elapsed" -lt 120 ]; do
     elapsed=$((elapsed + 2))
 done
 
+# 1.5 Recovery 刷入或安装期包管理器未就绪时的内嵌 APK 开机补装兜底（仅执行一次，绝不阻断守护）
+if [ -f "$MODDIR/apk_install.sh" ] && [ -f "$MODDIR/files/VoWiFiX.apk" ]; then
+    . "$MODDIR/apk_install.sh"
+    vowifix_install_bundled_apk "$MODDIR" "boot" "$LOG_FILE" || true
+fi
+
 # 2. 等待基带版本号非空且至少一张 SIM 加载完成（最长 60 秒）
 elapsed=0
 while [ "$elapsed" -lt 60 ]; do

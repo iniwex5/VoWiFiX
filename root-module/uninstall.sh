@@ -4,8 +4,27 @@
 DATA_DIR="/data/adb/vowifix"
 CELL_CONF="$DATA_DIR/cell_block.conf"
 LOG_FILE="$DATA_DIR/service.log"
+PKG_NAME="io.iniwex.vowifix"
 FULL_BIN="11011111101111111111"
 FULL_RAF=916479
+
+# 在包管理器就绪后同步卸载配套 VoWiFiX APK（保留 /data/adb/vowifix/*_orig.bin 原始 EFS 备份）
+uninstall_bundled_apk() {
+    t=0
+    while ! pm path android 2>/dev/null | grep -q "^package:" && [ "$t" -lt 60 ]; do
+        sleep 2
+        t=$((t + 2))
+    done
+    if pm path "$PKG_NAME" 2>/dev/null | grep -q "^package:"; then
+        if pm uninstall "$PKG_NAME" >/dev/null 2>&1; then
+            mkdir -p "$DATA_DIR" 2>/dev/null
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [uninstall] uninstalled companion APK ($PKG_NAME)" >> "$LOG_FILE" 2>/dev/null
+        else
+            mkdir -p "$DATA_DIR" 2>/dev/null
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: [uninstall] failed to uninstall companion APK ($PKG_NAME)" >> "$LOG_FILE" 2>/dev/null
+        fi
+    fi
+}
 
 is_iso_mask() {
     case "$1" in
@@ -101,6 +120,7 @@ perform_uninstall_restore() {
     rm -f "$CELL_CONF"
     mkdir -p "$DATA_DIR" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: [uninstall] cell block rules & snapshots cleaned and cellular restored" >> "$LOG_FILE" 2>/dev/null
+    uninstall_bundled_apk
 }
 
 if [ ! -f "$CELL_CONF" ] && [ ! -f "$DATA_DIR/slot0_cell_orig.conf" ] && [ ! -f "$DATA_DIR/slot1_cell_orig.conf" ]; then
@@ -120,6 +140,19 @@ if [ ! -f "$CELL_CONF" ] && [ ! -f "$DATA_DIR/slot0_cell_orig.conf" ] && [ ! -f 
     settings delete global vowifix_cell_exempt_cn >/dev/null 2>&1
     settings delete global vowifix_modem_raf_slot0 >/dev/null 2>&1
     settings delete global vowifix_modem_raf_slot1 >/dev/null 2>&1
+    if [ "$(getprop sys.boot_completed)" = "1" ]; then
+        uninstall_bundled_apk
+    else
+        (
+            t=0
+            while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$t" -lt 60 ]; do
+                sleep 2
+                t=$((t + 2))
+            done
+            sleep 3
+            uninstall_bundled_apk
+        ) </dev/null >/dev/null 2>&1 &
+    fi
     exit 0
 fi
 

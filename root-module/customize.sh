@@ -1,9 +1,10 @@
 #!/system/bin/sh
 SKIPUNZIP=0
 
-ui_print "- Installing VoWiFiX v1.0.9 (by iniwex)"
+ui_print "- Installing VoWiFiX v1.0.10 (by iniwex)"
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/system/bin" 0 0 0755 0755
+[ -f "$MODPATH/apk_install.sh" ] && set_perm "$MODPATH/apk_install.sh" 0 0 0755
 set_perm "$MODPATH/service.sh" 0 0 0755
 [ -f "$MODPATH/uninstall.sh" ] && set_perm "$MODPATH/uninstall.sh" 0 0 0755
 
@@ -31,8 +32,12 @@ if [ -d "$OLD_DIR" ]; then
   fi
 fi
 
-# 仅在开机状态下就地安全合并高通 Modem EFS，使首次安装只需重启 1 次即可全栈生效
+# 开机态刷入时：先流式自动安装/升级内嵌 VoWiFiX APK（保留作用域与 Root 授权），再就地合并 Modem EFS
 if [ "$BOOTMODE" = "true" ] || [ "$(getprop sys.boot_completed)" = "1" ]; then
+  if [ -f "$MODPATH/apk_install.sh" ] && [ -f "$MODPATH/files/VoWiFiX.apk" ]; then
+    . "$MODPATH/apk_install.sh"
+    vowifix_install_bundled_apk "$MODPATH" "install" "$LOG_FILE" || true
+  fi
   chmod 0755 "$PATCHER" 2>/dev/null
   BB="$(getprop gsm.version.baseband)"
   if [ -x "$PATCHER" ] && [ -n "$BB" ]; then
@@ -86,5 +91,5 @@ if [ "$BOOTMODE" = "true" ] || [ "$(getprop sys.boot_completed)" = "1" ]; then
     ui_print "- 未检测到就绪的高通基带，跳过安装期 EFS 合并（开机由 service.sh 兜底）"
   fi
 else
-  ui_print "- 非开机刷入环境（Recovery），将在首次开机后由 service.sh 自动完成 EFS 合并"
+  ui_print "- 非开机刷入环境（Recovery），将在首次开机后由 service.sh 自动补装 VoWiFiX APK 并完成 EFS 合并"
 fi

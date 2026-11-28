@@ -81,10 +81,13 @@ flowchart TB
 ### 1. 安装模块与插件
 
 1. 从 Releases 下载（或自行构建）：
-   - `VoWiFiX-v1.0.9.zip`（Root 模块，模块 ID：`vowifix`）
-   - `VoWiFiX-LSPosed-v1.0.9.apk`（LSPosed 插件 + 控制台，包名：`io.iniwex.vowifix`）
-2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.9.zip`（若曾安装旧版 `vowifix_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`）。
-3. 安装 `VoWiFiX-LSPosed-v1.0.9.apk`，并在 **LSPosed / Vector 管理器** 中启用 **VoWiFiX**，勾选以下作用域（`arrays.xml` 内置预设）：
+   - `VoWiFiX-v1.0.10.zip`（**一体化 Root 模块**，模块 ID：`vowifix`，已内置配套控制台与 LSPosed 模块 APK）
+   - `VoWiFiX-LSPosed-v1.0.10.apk`（独立 APK 备选，仅在少数定制系统拦截安装期 `pm install` 时手动安装）
+2. 在 **KernelSU / APatch / Magisk** 管理器中刷入 `VoWiFiX-v1.0.10.zip`：
+   - 开机态刷入时，安装脚本会通过 `pm install` 流式自动安装或无感覆盖升级 `VoWiFiX` APK（保留原有 Root 授权与 LSPosed 作用域，跳过同版本/降级安装且遇到签名不一致时不强行卸载）；
+   - Recovery 环境刷入时，将在首次开机后由 `service.sh` 自动补装；
+   - 若曾安装旧版 `vowifi_carrier_bypass`，安装脚本会自动从 `/data/adb/vowifi_efs_backup/` 无损迁移历史备份与日志至 `/data/adb/vowifix/`。
+3. 打开 **LSPosed / Vector 管理器**，首次安装请启用 **VoWiFiX** 并确认勾选以下作用域（`arrays.xml` 内置预设；后续升级模块 Zip 无需重新勾选）：
    - `android` / `system`（系统框架）
    - `com.android.phone`（电话服务）
    - `com.android.settings`（系统设置）
@@ -121,7 +124,7 @@ flowchart TB
      ```sh
      /data/adb/modules/vowifix/system/bin/vowifix-efs restore all --backup-dir /data/adb/vowifix
      ```
-   - 卸载 Root 模块时，`uninstall.sh` 会自动通知进程内 Hook 切回全自动选网并清理残留控制键；如需还原原始 EFS，可在卸载前在控制台点击一次备份还原。
+   - 卸载 Root 模块时，`uninstall.sh` 会自动通知进程内 Hook 切回全自动选网、清理残留控制键并同步卸载配套 `VoWiFiX` APK（保留 `/data/adb/vowifix/*_orig.bin` 原始 EFS 备份）；如需还原原始 EFS，可在卸载前在控制台点击一次备份还原。
 
 ---
 
@@ -133,10 +136,11 @@ VoWiFiX/
 │   └── vowifix_efs.c                 # 高通 Diag/EFS2 读写校验、6 键合并、3 字节解锁与 QRTR QMI 刷新/只读状态源码（含 --self-test）
 ├── root-module/                      # KernelSU / APatch / Magisk 通用三通模块模板
 │   ├── META-INF/com/google/android/  # Magisk updater-script / update-binary
-│   ├── customize.sh                  # 安装脚本：无损迁移旧备份并就地安全合并 EFS
+│   ├── apk_install.sh                # 内嵌 APK 流式安装与版本/签名保护助手（customize.sh 与 service.sh 共用）
+│   ├── customize.sh                  # 安装脚本：流式安装内嵌 APK、无损迁移旧备份并就地安全合并 EFS
 │   ├── module.prop                   # 模块元信息（id=vowifix）
-│   ├── service.sh                    # 单实例切卡守护（含 siminfo 校准、禁蜂窝配置同步、flock 与防抖冷却）
-│   ├── uninstall.sh                  # 卸载脚本：自动通知恢复自动选网并清理残留配置与控制键
+│   ├── service.sh                    # 单实例切卡守护（含 APK 补装兜底、siminfo 校准、禁蜂窝同步、flock 与防抖冷却）
+│   ├── uninstall.sh                  # 卸载脚本：自动通知恢复自动选网、清理配置键并同步卸载配套 APK
 │   └── system.prop                   # Layer 1 系统属性覆盖
 ├── lsposed-module/                   # 纯 Java 17 + Android 原生 View 控制台与 Xposed 工程（零三方依赖）
 │   ├── app/
