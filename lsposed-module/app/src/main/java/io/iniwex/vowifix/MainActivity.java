@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Insets;
 import android.graphics.Typeface;
@@ -242,7 +243,7 @@ public class MainActivity extends Activity {
         tvApp.setTypeface(Typeface.DEFAULT_BOLD);
         titleGroup.addView(tvApp);
 
-        TextView badgeVer = UiHelper.makeBadge(this, "v1.0.8", palette.accent, palette.accentBg);
+        TextView badgeVer = UiHelper.makeBadge(this, resolveVersionLabel(), palette.accent, palette.accentBg);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         verLp.leftMargin = UiHelper.dp(this, 8);
@@ -263,6 +264,27 @@ public class MainActivity extends Activity {
         bar.addView(btnToggleLauncher);
 
         return bar;
+    }
+
+    /**
+     * 从当前应用包信息动态读取版本号标签（如 v1.0.10），避免界面硬编码滞后。
+     */
+    @SuppressWarnings("deprecation")
+    private String resolveVersionLabel() {
+        try {
+            PackageManager pm = getPackageManager();
+            PackageInfo info;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                info = pm.getPackageInfo(getPackageName(), PackageManager.PackageInfoFlags.of(0));
+            } else {
+                info = pm.getPackageInfo(getPackageName(), 0);
+            }
+            if (info != null && !TextUtils.isEmpty(info.versionName)) {
+                return info.versionName.startsWith("v") ? info.versionName : "v" + info.versionName;
+            }
+        } catch (Throwable ignored) {
+        }
+        return "v?";
     }
 
     private View buildOverviewCard() {
